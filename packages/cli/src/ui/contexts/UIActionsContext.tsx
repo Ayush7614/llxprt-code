@@ -80,6 +80,7 @@ export interface UIActions {
   closeProfileDetailDialog: () => void;
   loadProfileFromDetail: (profileName: string) => void;
   deleteProfileFromDetail: (profileName: string) => void;
+  deleteProfileFromList: (profileName: string) => void;
   setProfileAsDefault: (profileName: string) => void;
   openProfileEditor: (profileName: string, openedDirectly?: boolean) => void;
   closeProfileEditor: () => void;

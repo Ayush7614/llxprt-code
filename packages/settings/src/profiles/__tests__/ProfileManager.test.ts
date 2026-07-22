@@ -188,6 +188,35 @@ describe('ProfileManager — deleteProfile', () => {
   it('throws when deleting a nonexistent profile', async () => {
     await expect(pm.deleteProfile('nonexistent')).rejects.toThrow('not found');
   });
+
+  it('refuses to delete a profile still referenced by a load balancer', async () => {
+    const member = {
+      version: 1,
+      provider: 'openai',
+      model: 'gpt-4',
+      modelParams: {},
+      ephemeralSettings: {},
+    };
+    const lb = {
+      version: 1,
+      type: 'loadbalancer' as const,
+      policy: 'roundrobin',
+      profiles: ['member-a'],
+      provider: '',
+      model: '',
+      modelParams: {},
+      ephemeralSettings: {},
+    };
+    await pm.saveProfile('member-a', member);
+    await pm.saveLoadBalancerProfile('lb-main', lb);
+
+    await expect(pm.deleteProfile('member-a')).rejects.toThrow(
+      /referenced by load balancer profile\(s\): lb-main/,
+    );
+    await expect(
+      fs.access(path.join(tempDir, 'member-a.json')),
+    ).resolves.toBeUndefined();
+  });
 });
 
 describe('ProfileManager — profileExists', () => {

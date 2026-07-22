@@ -370,6 +370,7 @@ function buildUIActionsParams(r: HookResults) {
     closeProfileDetailDialog: d.closeProfileDetailDialog,
     loadProfileFromDetail: d.loadProfileFromDetail,
     deleteProfileFromDetail: d.deleteProfileFromDetail,
+    deleteProfileFromList: d.deleteProfileFromList,
     setProfileAsDefault: d.setProfileAsDefault,
     openProfileEditor: d.openProfileEditor,
     closeProfileEditor: d.closeProfileEditor,

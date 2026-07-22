@@ -77,6 +77,7 @@ export interface UIActionsParams {
   closeProfileDetailDialog: () => void;
   loadProfileFromDetail: (profileName: string) => void;
   deleteProfileFromDetail: (profileName: string) => void;
+  deleteProfileFromList: (profileName: string) => void;
   setProfileAsDefault: (profileName: string) => void;
   openProfileEditor: (profileName: string, openedDirectly?: boolean) => void;
   closeProfileEditor: () => void;
@@ -240,6 +241,7 @@ export function buildUIActions(params: UIActionsParams): UIActions {
     closeProfileDetailDialog: params.closeProfileDetailDialog,
     loadProfileFromDetail: params.loadProfileFromDetail,
     deleteProfileFromDetail: params.deleteProfileFromDetail,
+    deleteProfileFromList: params.deleteProfileFromList,
     setProfileAsDefault: params.setProfileAsDefault,
     openProfileEditor: params.openProfileEditor,
     closeProfileEditor: params.closeProfileEditor,

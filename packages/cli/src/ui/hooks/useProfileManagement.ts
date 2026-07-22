@@ -153,52 +153,60 @@ function useProfileLoader(
   setDefaultProfileName: React.Dispatch<React.SetStateAction<string | null>>,
   setActiveProfileName: React.Dispatch<React.SetStateAction<string | null>>,
 ) {
-  return useCallback(async () => {
-    setIsLoading(true);
-    setProfileError(null);
-
-    try {
-      const profileNames = await runtime.listSavedProfiles();
-      const profileItems = await fetchProfileItems(runtime, profileNames);
-      setProfiles(profileItems);
+  return useCallback(
+    async (options?: { showLoading?: boolean }) => {
+      const showLoading = options?.showLoading !== false;
+      if (showLoading) {
+        setIsLoading(true);
+      }
+      setProfileError(null);
 
       try {
-        const services = runtime.getCliRuntimeServices();
-        const defaultName = services.settingsService.get('defaultProfile') as
-          | string
-          | null;
-        setDefaultProfileName(defaultName ?? null);
-      } catch {
-        // Ignore errors getting default profile
-      }
+        const profileNames = await runtime.listSavedProfiles();
+        const profileItems = await fetchProfileItems(runtime, profileNames);
+        setProfiles(profileItems);
 
-      try {
-        const diagnostics = runtime.getRuntimeDiagnosticsSnapshot();
-        setActiveProfileName(diagnostics.profileName);
-      } catch {
-        // Ignore errors getting active profile
+        try {
+          const services = runtime.getCliRuntimeServices();
+          const defaultName = services.settingsService.get('defaultProfile') as
+            | string
+            | null;
+          setDefaultProfileName(defaultName ?? null);
+        } catch {
+          // Ignore errors getting default profile
+        }
+
+        try {
+          const diagnostics = runtime.getRuntimeDiagnosticsSnapshot();
+          setActiveProfileName(diagnostics.profileName);
+        } catch {
+          // Ignore errors getting active profile
+        }
+      } catch (error) {
+        setProfileError(
+          error instanceof Error ? error.message : 'Failed to load profiles',
+        );
+        addMessage({
+          type: MessageType.ERROR,
+          content: `Failed to load profiles: ${error instanceof Error ? error.message : 'Unknown error'}`,
+          timestamp: new Date(),
+        });
+      } finally {
+        if (showLoading) {
+          setIsLoading(false);
+        }
       }
-    } catch (error) {
-      setProfileError(
-        error instanceof Error ? error.message : 'Failed to load profiles',
-      );
-      addMessage({
-        type: MessageType.ERROR,
-        content: `Failed to load profiles: ${error instanceof Error ? error.message : 'Unknown error'}`,
-        timestamp: new Date(),
-      });
-    } finally {
-      setIsLoading(false);
-    }
-  }, [
-    runtime,
-    addMessage,
-    setProfiles,
-    setIsLoading,
-    setProfileError,
-    setDefaultProfileName,
-    setActiveProfileName,
-  ]);
+    },
+    [
+      runtime,
+      addMessage,
+      setProfiles,
+      setIsLoading,
+      setProfileError,
+      setDefaultProfileName,
+      setActiveProfileName,
+    ],
+  );
 }
 
 function useListDialogActions(
@@ -332,7 +340,7 @@ function useDeleteProfileAction(
   addMessage: AddMessageFn,
   appDispatch: ReturnType<typeof useAppDispatch>,
   runtime: ReturnType<typeof useRuntimeApi>,
-  loadProfiles: () => Promise<void>,
+  loadProfiles: (options?: { showLoading?: boolean }) => Promise<void>,
 ) {
   return useCallback(
     async (profileName: string) => {
@@ -355,6 +363,34 @@ function useDeleteProfileAction(
       }
     },
     [addMessage, appDispatch, runtime, loadProfiles],
+  );
+}
+
+function useDeleteProfileFromListAction(
+  addMessage: AddMessageFn,
+  runtime: ReturnType<typeof useRuntimeApi>,
+  loadProfiles: (options?: { showLoading?: boolean }) => Promise<void>,
+) {
+  return useCallback(
+    async (profileName: string) => {
+      try {
+        await runtime.deleteProfileByName(profileName);
+        addMessage({
+          type: MessageType.INFO,
+          content: `Profile '${profileName}' deleted`,
+          timestamp: new Date(),
+        });
+        // Refresh in place without the loading flash so selection can clamp.
+        await loadProfiles({ showLoading: false });
+      } catch (error) {
+        addMessage({
+          type: MessageType.ERROR,
+          content: `Failed to delete profile: ${error instanceof Error ? error.message : String(error)}`,
+          timestamp: new Date(),
+        });
+      }
+    },
+    [addMessage, runtime, loadProfiles],
   );
 }
 
@@ -509,7 +545,7 @@ function useProfileDispatchActions(
   addMessage: AddMessageFn,
   appDispatch: ReturnType<typeof useAppDispatch>,
   runtime: ReturnType<typeof useRuntimeApi>,
-  loadProfiles: () => Promise<void>,
+  loadProfiles: (options?: { showLoading?: boolean }) => Promise<void>,
   dataStates: ReturnType<typeof useProfileDataStates>,
   viewProfileDetail: (name: string, direct: boolean) => Promise<void>,
 ) {
@@ -522,6 +558,11 @@ function useProfileDispatchActions(
   const deleteProfile = useDeleteProfileAction(
     addMessage,
     appDispatch,
+    runtime,
+    loadProfiles,
+  );
+  const deleteProfileFromList = useDeleteProfileFromListAction(
+    addMessage,
     runtime,
     loadProfiles,
   );
@@ -560,6 +601,7 @@ function useProfileDispatchActions(
   return {
     loadProfile,
     deleteProfile,
+    deleteProfileFromList,
     setDefault,
     openEditor,
     closeEditor,
@@ -618,6 +660,7 @@ export const useProfileManagement = ({
   const {
     loadProfile,
     deleteProfile,
+    deleteProfileFromList,
     setDefault,
     openEditor,
     closeEditor,
@@ -653,6 +696,7 @@ export const useProfileManagement = ({
     closeDetailDialog,
     loadProfile,
     deleteProfile,
+    deleteProfileFromList,
     setDefault,
 
     // Editor actions

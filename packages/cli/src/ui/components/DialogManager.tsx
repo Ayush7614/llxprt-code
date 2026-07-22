@@ -416,6 +416,7 @@ function renderProfileListDialogView(
         onSelect={uiActions.loadProfileFromDetail}
         onClose={uiActions.closeProfileListDialog}
         onViewDetail={uiActions.viewProfileDetail}
+        onDelete={uiActions.deleteProfileFromList}
         isLoading={uiState.profileDialogLoading}
         defaultProfileName={uiState.defaultProfileName ?? undefined}
         activeProfileName={uiState.activeProfileName ?? undefined}

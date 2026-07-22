@@ -59,6 +59,7 @@ const makeParams = (): UIActionsParams => ({
   closeProfileDetailDialog: vi.fn(),
   loadProfileFromDetail: vi.fn(),
   deleteProfileFromDetail: vi.fn(),
+  deleteProfileFromList: vi.fn(),
   setProfileAsDefault: vi.fn(),
   openProfileEditor: vi.fn(),
   closeProfileEditor: vi.fn(),
@@ -191,6 +192,7 @@ describe('buildUIActions', () => {
     expect(result.closeProfileDetailDialog).toBeDefined();
     expect(result.loadProfileFromDetail).toBeDefined();
     expect(result.deleteProfileFromDetail).toBeDefined();
+    expect(result.deleteProfileFromList).toBeDefined();
     expect(result.setProfileAsDefault).toBeDefined();
     expect(result.openProfileEditor).toBeDefined();
     expect(result.closeProfileEditor).toBeDefined();
@@ -270,6 +272,7 @@ describe('buildUIActions', () => {
     );
     expect(result.loadProfileFromDetail).toBe(params.loadProfileFromDetail);
     expect(result.deleteProfileFromDetail).toBe(params.deleteProfileFromDetail);
+    expect(result.deleteProfileFromList).toBe(params.deleteProfileFromList);
     expect(result.setProfileAsDefault).toBe(params.setProfileAsDefault);
     expect(result.openProfileEditor).toBe(params.openProfileEditor);
     expect(result.closeProfileEditor).toBe(params.closeProfileEditor);

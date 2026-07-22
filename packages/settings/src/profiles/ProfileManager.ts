@@ -245,10 +245,52 @@ export class ProfileManager {
   }
 
   /**
+   * Find load-balancer profiles that reference the given member profile.
+   */
+  private async findLoadBalancersReferencing(
+    profileName: string,
+  ): Promise<string[]> {
+    const names = await this.listProfiles();
+    const referencing: string[] = [];
+
+    for (const name of names) {
+      if (name === profileName) {
+        continue;
+      }
+      try {
+        const filePath = path.join(this.profilesDir, `${name}.json`);
+        const content = await fs.readFile(filePath, 'utf8');
+        const parsed: unknown = JSON.parse(content);
+        if (
+          isPlainObject(parsed) &&
+          parsed.type === 'loadbalancer' &&
+          Array.isArray(parsed.profiles) &&
+          parsed.profiles.includes(profileName)
+        ) {
+          referencing.push(name);
+        }
+      } catch {
+        // Skip unreadable/corrupt profiles when checking references.
+      }
+    }
+
+    return referencing;
+  }
+
+  /**
    * Delete a profile.
    * @param profileName The name of the profile to delete
    */
   async deleteProfile(profileName: string): Promise<void> {
+    const referencing = await this.findLoadBalancersReferencing(profileName);
+    if (referencing.length > 0) {
+      throw new Error(
+        `Cannot delete profile '${profileName}': it is referenced by load balancer profile(s): ${referencing.join(
+          ', ',
+        )}`,
+      );
+    }
+
     try {
       await deleteProfileFile(this.profilesDir, profileName);
     } catch (error) {

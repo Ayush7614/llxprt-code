@@ -381,6 +381,7 @@ function useDialogsProfiles(p: AppDialogsParams) {
     closeProfileDetailDialog: profileMgmt.closeDetailDialog,
     loadProfileFromDetail: profileMgmt.loadProfile,
     deleteProfileFromDetail: profileMgmt.deleteProfile,
+    deleteProfileFromList: profileMgmt.deleteProfileFromList,
     setProfileAsDefault: profileMgmt.setDefault,
     openProfileEditor: profileMgmt.openEditor,
     closeProfileEditor: profileMgmt.closeEditor,
