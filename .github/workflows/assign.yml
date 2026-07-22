@@ -1,0 +1,57 @@
+name: Assign Issue
+
+# Implements the CONTRIBUTING.md `/assign` self-assignment convention.
+# Comment body must be exactly `/assign` (optional trailing LF/CRLF/tab only).
+
+on:
+  issue_comment:
+    types:
+      - created
+
+permissions:
+  contents: read
+  issues: write
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+  assign:
+    name: Process /assign
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Exact `/assign` only (CONTRIBUTING.md). Support LF, CRLF, and trailing tab
+    # via toJSON equality (not startsWith) so `/assign foo` never matches.
+    # Ignore PR review comments — this workflow is for issues only.
+    if: |
+      github.event.issue.pull_request == null &&
+      (github.event.comment.body == '/assign' ||
+       toJSON(github.event.comment.body) == '"/assign\n"' ||
+       toJSON(github.event.comment.body) == '"/assign\r\n"' ||
+       toJSON(github.event.comment.body) == '"/assign\t"')
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.event.issue.number }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # ratchet:actions/checkout@v5
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Run assign-issue script
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          COMMENTER_LOGIN: ${{ github.event.comment.user.login }}
+          AUTHOR_ASSOCIATION: ${{ github.event.comment.author_association }}
+        run: |
+          set -euo pipefail
+          chmod +x ./.github/scripts/assign-issue.sh
+          ./.github/scripts/assign-issue.sh
