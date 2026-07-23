@@ -590,10 +590,10 @@ function useProfileDispatchActions(
   };
 }
 
-function buildProfileManagementResult(
+function buildProfileManagementResult<TActions extends object>(
   dialogStates: ReturnType<typeof useProfileDialogStates>,
   dataStates: ReturnType<typeof useProfileDataStates>,
-  actions: Record<string, unknown>,
+  actions: TActions,
 ) {
   return {
     ...dialogStates,
