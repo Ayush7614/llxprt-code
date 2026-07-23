@@ -251,30 +251,30 @@ export class ProfileManager {
     profileName: string,
   ): Promise<string[]> {
     const names = await this.listProfiles();
-    const referencing: string[] = [];
-
-    for (const name of names) {
-      if (name === profileName) {
-        continue;
-      }
-      try {
-        const filePath = path.join(this.profilesDir, `${name}.json`);
-        const content = await fs.readFile(filePath, 'utf8');
-        const parsed: unknown = JSON.parse(content);
-        if (
-          isPlainObject(parsed) &&
-          parsed.type === 'loadbalancer' &&
-          Array.isArray(parsed.profiles) &&
-          parsed.profiles.includes(profileName)
-        ) {
-          referencing.push(name);
+    const checks = names
+      .filter((name) => name !== profileName)
+      .map(async (name) => {
+        try {
+          const filePath = path.join(this.profilesDir, `${name}.json`);
+          const content = await fs.readFile(filePath, 'utf8');
+          const parsed: unknown = JSON.parse(content);
+          if (
+            isPlainObject(parsed) &&
+            parsed.type === 'loadbalancer' &&
+            Array.isArray(parsed.profiles) &&
+            parsed.profiles.includes(profileName)
+          ) {
+            return name;
+          }
+        } catch {
+          // Skip unreadable/corrupt profiles when checking references.
         }
-      } catch {
-        // Skip unreadable/corrupt profiles when checking references.
-      }
-    }
+        return null;
+      });
 
-    return referencing;
+    return (await Promise.all(checks)).filter(
+      (name): name is string => name !== null,
+    );
   }
 
   /**

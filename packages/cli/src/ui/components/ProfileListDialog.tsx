@@ -287,8 +287,10 @@ const WideSelectionDetail: React.FC<{
   index: number;
   isSearching: boolean;
 }> = ({ filteredProfiles, index, isSearching }) => {
+  if (isSearching || index < 0 || index >= filteredProfiles.length) {
+    return null;
+  }
   const selected = filteredProfiles[index];
-  if (filteredProfiles.length === 0 || isSearching || !selected) return null;
 
   return (
     <Box marginTop={1}>
@@ -437,6 +439,26 @@ const EmptyState: React.FC = () => (
   </Box>
 );
 
+function handleDeleteConfirmKeys(
+  key: { name?: string; sequence?: string },
+  confirmDeleteName: string,
+  setConfirmDeleteName: React.Dispatch<React.SetStateAction<string | null>>,
+  onDelete: (name: string) => void,
+): void {
+  if (key.name === 'escape') {
+    setConfirmDeleteName(null);
+    return;
+  }
+  if (key.sequence === 'y' || key.sequence === 'Y') {
+    setConfirmDeleteName(null);
+    onDelete(confirmDeleteName);
+    return;
+  }
+  if (key.sequence === 'n' || key.sequence === 'N') {
+    setConfirmDeleteName(null);
+  }
+}
+
 function useListKeypress(
   isSearching: boolean,
   searchTerm: string,
@@ -456,20 +478,13 @@ function useListKeypress(
 ) {
   const handleKeypress = useCallback(
     (key: Parameters<Parameters<typeof useKeypress>[0]>[0]) => {
-      if (confirmDeleteName) {
-        if (key.name === 'escape') {
-          setConfirmDeleteName(null);
-          return;
-        }
-        if (key.sequence === 'y' || key.sequence === 'Y') {
-          const name = confirmDeleteName;
-          setConfirmDeleteName(null);
-          onDelete(name);
-          return;
-        }
-        if (key.sequence === 'n' || key.sequence === 'N') {
-          setConfirmDeleteName(null);
-        }
+      if (confirmDeleteName !== null) {
+        handleDeleteConfirmKeys(
+          key,
+          confirmDeleteName,
+          setConfirmDeleteName,
+          onDelete,
+        );
         return;
       }
 
@@ -625,16 +640,51 @@ const ProfileListBody: React.FC<{
   );
 };
 
-export const ProfileListDialog: React.FC<ProfileListDialogProps> = ({
-  profiles,
-  onSelect,
-  onClose,
-  onViewDetail,
-  onDelete,
-  isLoading = false,
-  defaultProfileName,
-  activeProfileName,
-}) => {
+function useConfirmDeleteClear(
+  confirmDeleteName: string | null,
+  filteredProfiles: ProfileListItem[],
+  setConfirmDeleteName: React.Dispatch<React.SetStateAction<string | null>>,
+): void {
+  useEffect(() => {
+    if (
+      confirmDeleteName !== null &&
+      !filteredProfiles.some((profile) => profile.name === confirmDeleteName)
+    ) {
+      setConfirmDeleteName(null);
+    }
+  }, [confirmDeleteName, filteredProfiles, setConfirmDeleteName]);
+}
+
+function useProfileListMove(
+  index: number,
+  filteredLength: number,
+  setIndex: React.Dispatch<React.SetStateAction<number>>,
+) {
+  return useCallback(
+    (delta: number) => {
+      if (filteredLength === 0) {
+        setIndex(0);
+        return;
+      }
+      let next = index + delta;
+      if (next < 0) next = 0;
+      if (next >= filteredLength) next = filteredLength - 1;
+      setIndex(next);
+    },
+    [index, filteredLength, setIndex],
+  );
+}
+
+function useProfileListController(opts: {
+  profiles: ProfileListItem[];
+  onSelect: (profileName: string) => void;
+  onClose: () => void;
+  onViewDetail: (profileName: string) => void;
+  onDelete: (profileName: string) => void;
+  isLoading: boolean;
+  activeProfileName?: string;
+  defaultProfileName?: string;
+}) {
   const { isNarrow, isWide, width } = useResponsive();
   const [searchTerm, setSearchTerm] = useState('');
   const [isSearching, setIsSearching] = useState(true);
@@ -645,10 +695,10 @@ export const ProfileListDialog: React.FC<ProfileListDialogProps> = ({
 
   const filteredProfiles = useMemo(
     () =>
-      profiles.filter((p) =>
+      opts.profiles.filter((p) =>
         p.name.toLowerCase().includes(searchTerm.toLowerCase()),
       ),
-    [profiles, searchTerm],
+    [opts.profiles, searchTerm],
   );
 
   const { columns, colWidth, rows } = useListLayout(
@@ -658,77 +708,82 @@ export const ProfileListDialog: React.FC<ProfileListDialogProps> = ({
   );
 
   useProfileListIndexBounds(searchTerm, filteredProfiles, setIndex);
-
-  // Clear pending delete confirmation if the target disappears from the list.
-  useEffect(() => {
-    if (
-      confirmDeleteName &&
-      !filteredProfiles.some((profile) => profile.name === confirmDeleteName)
-    ) {
-      setConfirmDeleteName(null);
-    }
-  }, [confirmDeleteName, filteredProfiles]);
-
-  const move = useCallback(
-    (delta: number) => {
-      if (filteredProfiles.length === 0) {
-        setIndex(0);
-        return;
-      }
-      let next = index + delta;
-      if (next < 0) next = 0;
-      if (next >= filteredProfiles.length) next = filteredProfiles.length - 1;
-      setIndex(next);
-    },
-    [index, filteredProfiles.length],
+  useConfirmDeleteClear(
+    confirmDeleteName,
+    filteredProfiles,
+    setConfirmDeleteName,
   );
+
+  const move = useProfileListMove(index, filteredProfiles.length, setIndex);
 
   useListKeypress(
     isSearching,
     searchTerm,
     setSearchTerm,
     setIsSearching,
-    onViewDetail,
+    opts.onViewDetail,
     index,
     filteredProfiles,
     move,
-    onSelect,
-    onDelete,
+    opts.onSelect,
+    opts.onDelete,
     columns,
-    onClose,
-    isLoading,
+    opts.onClose,
+    opts.isLoading,
     confirmDeleteName,
     setConfirmDeleteName,
   );
 
-  const grid = buildGrid(
-    filteredProfiles,
-    rows,
-    columns,
-    index,
-    isSearching,
+  return {
     isNarrow,
-    isWide,
-    activeProfileName,
-    defaultProfileName,
-    colWidth,
-  );
+    width,
+    isSearching,
+    searchTerm,
+    filteredProfiles,
+    index,
+    confirmDeleteName,
+    grid: buildGrid(
+      filteredProfiles,
+      rows,
+      columns,
+      index,
+      isSearching,
+      isNarrow,
+      isWide,
+      opts.activeProfileName,
+      opts.defaultProfileName,
+      colWidth,
+    ),
+  };
+}
 
-  if (isLoading) return <LoadingState />;
-  if (profiles.length === 0) return <EmptyState />;
+export const ProfileListDialog: React.FC<ProfileListDialogProps> = (props) => {
+  const controller = useProfileListController({
+    profiles: props.profiles,
+    onSelect: props.onSelect,
+    onClose: props.onClose,
+    onViewDetail: props.onViewDetail,
+    onDelete: props.onDelete,
+    isLoading: props.isLoading === true,
+    activeProfileName: props.activeProfileName,
+    defaultProfileName: props.defaultProfileName,
+  });
+
+  if (props.isLoading === true) return <LoadingState />;
+  if (props.profiles.length === 0) return <EmptyState />;
 
   return (
     <ProfileListBody
-      isNarrow={isNarrow}
-      width={width}
-      isSearching={isSearching}
-      searchTerm={searchTerm}
-      filteredProfiles={filteredProfiles}
-      index={index}
-      grid={grid}
-      confirmDeleteName={confirmDeleteName}
-      activeProfileName={activeProfileName}
-      defaultProfileName={defaultProfileName}
+      isNarrow={controller.isNarrow}
+      width={controller.width}
+      isSearching={controller.isSearching}
+      searchTerm={controller.searchTerm}
+      filteredProfiles={controller.filteredProfiles}
+      index={controller.index}
+      grid={controller.grid}
+      confirmDeleteName={controller.confirmDeleteName}
+      activeProfileName={props.activeProfileName}
+      defaultProfileName={props.defaultProfileName}
     />
   );
 };
