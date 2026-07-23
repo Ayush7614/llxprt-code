@@ -8,15 +8,8 @@ AUTO_ASSIGNED_LABEL='auto-assigned'
 STALE_DAYS=14
 EXEMPT_LOGIN='acoliver'
 
-require_env() {
-  local name="$1"
-  if [[ -z "${!name:-}" ]]; then
-    echo "‼️ Missing \$${name} - this must be run from GitHub Actions" >&2
-    exit 1
-  fi
-}
-
-require_env GITHUB_REPOSITORY
+# shellcheck disable=SC2154
+: "${GITHUB_REPOSITORY:?Missing GITHUB_REPOSITORY}"
 
 if [[ -n "${GH_TOKEN:-}" ]]; then
   export GH_TOKEN
@@ -107,7 +100,7 @@ has_linked_pr_activity() {
   local issue_number="$1"
   local assignee="$2"
 
-  # Any PR by the assignee that mentions this issue number in title/body.
+  # Prefer search API (unbounded) over a limited pr list.
   local pr_hits
   pr_hits="$(
     gh search prs \
@@ -118,15 +111,6 @@ has_linked_pr_activity() {
       "#${issue_number} in:title,body" \
       2>/dev/null || echo "0"
   )"
-
-  if [[ "${pr_hits}" == "0" || -z "${pr_hits}" ]]; then
-    pr_hits="$(
-      gh pr list --repo "${REPO}" --author "${assignee}" --state all --limit 50 \
-        --json number,title,body \
-        --jq "[.[] | select((.title // \"\" | contains(\"#${issue_number}\")) or (.body // \"\" | test(\"(?i)(closes?|fixes?|resolves?)?\\s*#${issue_number}\\b\")))] | length" \
-        2>/dev/null || echo "0"
-    )"
-  fi
 
   [[ "${pr_hits}" =~ ^[0-9]+$ ]] && [[ "${pr_hits}" -gt 0 ]]
 }
@@ -147,18 +131,17 @@ process_issue() {
 
   IFS=',' read -ra ASSIGNEES <<<"${assignees_csv}"
 
-  # Exempt: never unassign acoliver (ticket exception).
-  for login in "${ASSIGNEES[@]}"; do
-    if [[ "${login}" == "${EXEMPT_LOGIN}" ]]; then
-      echo "   🛡️ Skipping #${issue_number}: assignee @${EXEMPT_LOGIN} is exempt"
-      return 0
-    fi
-  done
-
   local keep=false
   local assignee
   for assignee in "${ASSIGNEES[@]}"; do
     [[ -z "${assignee}" ]] && continue
+
+    # Exempt acoliver only; other co-assignees can still be cleaned up.
+    if [[ "${assignee}" == "${EXEMPT_LOGIN}" ]]; then
+      echo "   🛡️ Keeping @${EXEMPT_LOGIN} on #${issue_number} (exempt)"
+      keep=true
+      continue
+    fi
 
     if ! assignment_age_ok_to_unassign "${issue_number}" "${assignee}" "${threshold_epoch}"; then
       keep=true
@@ -187,7 +170,6 @@ EOF
   done
 
   if [[ "${keep}" != "true" ]]; then
-    # Re-check assignees after removals.
     local remaining
     remaining="$(
       gh issue view "${issue_number}" --repo "${REPO}" --json assignees \

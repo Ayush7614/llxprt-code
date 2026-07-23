@@ -11,6 +11,9 @@ on:
 permissions:
   contents: read
   issues: write
+  # Required for `gh search prs --merged` eligibility checks under an explicit
+  # permissions block (public repos are not exempt once permissions: is set).
+  pull-requests: read
 
 defaults:
   run:
@@ -26,15 +29,17 @@ jobs:
     timeout-minutes: 10
     # Exact `/assign` only (CONTRIBUTING.md). Support LF, CRLF, and trailing tab
     # via toJSON equality (not startsWith) so `/assign foo` never matches.
-    # Ignore PR review comments — this workflow is for issues only.
+    # Ignore PR review comments and Bot accounts (spam hardening).
     if: |
       github.event.issue.pull_request == null &&
+      github.event.comment.user.type != 'Bot' &&
       (github.event.comment.body == '/assign' ||
        toJSON(github.event.comment.body) == '"/assign\n"' ||
        toJSON(github.event.comment.body) == '"/assign\r\n"' ||
        toJSON(github.event.comment.body) == '"/assign\t"')
+    # Per-issue cancel + per-actor serialize to blunt /assign floods.
     concurrency:
-      group: ${{ github.workflow }}-${{ github.event.issue.number }}
+      group: ${{ github.workflow }}-${{ github.event.issue.number }}-${{ github.event.comment.user.login }}
       cancel-in-progress: true
     steps:
       - name: Checkout repository

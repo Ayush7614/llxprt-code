@@ -30,17 +30,19 @@ describe('.github/workflows/assign.yml', () => {
     expect(workflow.on?.pull_request).toBeUndefined();
   });
 
-  it('uses least-privilege permissions', () => {
+  it('uses least-privilege permissions including pull-requests read', () => {
     expect(workflow.permissions).toEqual({
       contents: 'read',
       issues: 'write',
+      'pull-requests': 'read',
     });
   });
 
-  it('gates on exact /assign for issues (not PRs)', () => {
+  it('gates on exact /assign for issues (not PRs) and rejects bots', () => {
     expect(job, 'assign job should exist').toBeTruthy();
     const condition = normalize(job.if);
     expect(condition).toContain('github.event.issue.pull_request == null');
+    expect(condition).toContain("github.event.comment.user.type != 'Bot'");
     expect(condition).toContain("github.event.comment.body == '/assign'");
     expect(condition).toContain(
       `toJSON(github.event.comment.body) == '"/assign\\n"'`,
@@ -54,10 +56,10 @@ describe('.github/workflows/assign.yml', () => {
     );
   });
 
-  it('scopes concurrency by workflow and issue number', () => {
+  it('scopes concurrency by workflow, issue, and actor', () => {
     expect(job.concurrency?.['cancel-in-progress']).toBe(true);
     expect(normalize(job.concurrency?.group)).toBe(
-      '${{ github.workflow }}-${{ github.event.issue.number }}',
+      '${{ github.workflow }}-${{ github.event.issue.number }}-${{ github.event.comment.user.login }}',
     );
   });
 
@@ -105,6 +107,7 @@ describe('.github/workflows/assign-stale-cleanup.yml', () => {
     expect(workflow.permissions).toEqual({
       contents: 'read',
       issues: 'write',
+      'pull-requests': 'read',
     });
     const runStep = job.steps?.find(
       (s) => s.name === 'Run unassign-stale-issues script',

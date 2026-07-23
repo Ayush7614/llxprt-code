@@ -42,11 +42,11 @@ To assign an issue to yourself, add a comment that contains **only** the text `/
 
 1. The issue is not already assigned.
 2. You are eligible: you have at least one **merged PR** in this repository, **or** you have previously been assigned an issue here, **or** you are listed in [`.github/trusted-contributors.txt`](.github/trusted-contributors.txt), **or** you are a repository owner/member/collaborator.
-3. You currently have fewer than **3** open issues assigned to you.
+3. You currently have fewer than **3** open issues assigned to you (hard concurrency cap to limit spam / hoarding).
 
-On success the issue is labeled `auto-assigned`. If GitHub cannot assign you (for example, you do not have write access), the action posts feedback explaining the outcome so a maintainer can help.
+Bot accounts are ignored. On success the issue is labeled `auto-assigned`. If GitHub cannot assign you (for example, you do not have write access), the action posts feedback explaining the outcome so a maintainer can help.
 
-Auto-assignments with **no linked PR activity for 2 weeks** may be unassigned automatically (maintainer `acoliver` is exempt). Comment `/assign` again if you still intend to work on the issue.
+Auto-assignments with **no linked PR activity for 2 weeks** may be unassigned automatically (maintainer `acoliver` is exempt as an assignee; other co-assignees can still be cleaned up). Comment `/assign` again if you still intend to work on the issue.
 
 ### Pull Request Guidelines
 

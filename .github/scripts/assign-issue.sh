@@ -8,19 +8,14 @@ AUTO_ASSIGNED_LABEL='auto-assigned'
 MAX_ASSIGNMENTS=3
 TRUSTED_FILE='.github/trusted-contributors.txt'
 
-require_env() {
-  local name="$1"
-  if [[ -z "${!name:-}" ]]; then
-    echo "‼️ Missing \$${name} - this must be run from GitHub Actions" >&2
-    exit 1
-  fi
-}
+# Inputs are provided by GitHub Actions; declare them for shellcheck.
+# shellcheck disable=SC2154
+: "${GITHUB_REPOSITORY:?Missing GITHUB_REPOSITORY}"
+# shellcheck disable=SC2154
+: "${ISSUE_NUMBER:?Missing ISSUE_NUMBER}"
+# shellcheck disable=SC2154
+: "${COMMENTER_LOGIN:?Missing COMMENTER_LOGIN}"
 
-require_env GITHUB_REPOSITORY
-require_env ISSUE_NUMBER
-require_env COMMENTER_LOGIN
-
-# Prefer GH_TOKEN when both are set (gh CLI convention).
 if [[ -n "${GH_TOKEN:-}" ]]; then
   export GH_TOKEN
 elif [[ -n "${GITHUB_TOKEN:-}" ]]; then
@@ -31,8 +26,9 @@ else
 fi
 
 USER_LOGIN="${COMMENTER_LOGIN}"
-ISSUE_NUMBER="${ISSUE_NUMBER}"
+ISSUE="${ISSUE_NUMBER}"
 REPO="${GITHUB_REPOSITORY}"
+AUTHOR_ASSOCIATION="${AUTHOR_ASSOCIATION:-}"
 
 post_sticky_feedback() {
   local message="$1"
@@ -41,7 +37,7 @@ post_sticky_feedback() {
 
   local existing_id=""
   existing_id="$(
-    gh api "repos/${REPO}/issues/${ISSUE_NUMBER}/comments" --paginate \
+    gh api "repos/${REPO}/issues/${ISSUE}/comments" --paginate \
       --jq ".[] | select(.body != null and (.body | contains(\"${MARKER}\"))) | .id" 2>/dev/null \
       | head -n 1 || true
   )"
@@ -52,31 +48,31 @@ post_sticky_feedback() {
       echo "   ⚠️ Failed to update sticky feedback comment" >&2
     fi
   else
-    if ! gh issue comment "${ISSUE_NUMBER}" --repo "${REPO}" --body "${body}" >/dev/null 2>&1; then
+    if ! gh issue comment "${ISSUE}" --repo "${REPO}" --body "${body}" >/dev/null 2>&1; then
       echo "   ⚠️ Failed to post sticky feedback comment" >&2
     fi
   fi
 }
 
-echo "🔄 Processing /assign for issue #${ISSUE_NUMBER} by @${USER_LOGIN}"
+echo "🔄 Processing /assign for issue #${ISSUE} by @${USER_LOGIN}"
 
 # --- Guard: already assigned ---
 assignee_count="$(
-  gh issue view "${ISSUE_NUMBER}" --repo "${REPO}" --json assignees \
+  gh issue view "${ISSUE}" --repo "${REPO}" --json assignees \
     --jq '.assignees | length' 2>/dev/null || echo "0"
 )"
 
 if [[ "${assignee_count}" -gt 0 ]]; then
   current="$(
-    gh issue view "${ISSUE_NUMBER}" --repo "${REPO}" --json assignees \
+    gh issue view "${ISSUE}" --repo "${REPO}" --json assignees \
       --jq '[.assignees[].login] | join(", ")' 2>/dev/null || echo "someone"
   )"
-  echo "⚠️ Issue #${ISSUE_NUMBER} is already assigned to: ${current}"
+  echo "⚠️ Issue #${ISSUE} is already assigned to: ${current}"
   post_sticky_feedback "❌ Could not assign @${USER_LOGIN}: this issue is already assigned to **${current}**."
   exit 0
 fi
 
-# --- Cap: max concurrent open assignments ---
+# --- Cap: max concurrent open assignments (spam / concurrency guard) ---
 open_assigned_count="$(
   gh search issues --repo "${REPO}" --assignee "${USER_LOGIN}" --state open \
     --json number --jq 'length' 2>/dev/null || echo "0"
@@ -120,13 +116,12 @@ if [[ "${is_eligible}" != "true" && -f "${TRUSTED_FILE}" ]]; then
   fi
 fi
 
-# Owners/members/collaborators are always eligible (author_association not
-# always available here; treat repository permission via association env).
-AUTHOR_ASSOCIATION="${AUTHOR_ASSOCIATION:-}"
 case "${AUTHOR_ASSOCIATION}" in
   OWNER | MEMBER | COLLABORATOR)
     is_eligible=true
     eligibility_reason="repository ${AUTHOR_ASSOCIATION}"
+    ;;
+  *)
     ;;
 esac
 
@@ -139,13 +134,12 @@ fi
 echo "✅ Eligible via: ${eligibility_reason}"
 
 # --- Assign ---
-if ! gh issue edit "${ISSUE_NUMBER}" --repo "${REPO}" --add-assignee "${USER_LOGIN}" >/dev/null 2>&1; then
+if ! gh issue edit "${ISSUE}" --repo "${REPO}" --add-assignee "${USER_LOGIN}" >/dev/null 2>&1; then
   echo "⚠️ gh issue edit --add-assignee failed for @${USER_LOGIN}"
 fi
 
-# Verify assignment took effect (GitHub silently ignores non-collaborators).
 assigned_logins="$(
-  gh issue view "${ISSUE_NUMBER}" --repo "${REPO}" --json assignees \
+  gh issue view "${ISSUE}" --repo "${REPO}" --json assignees \
     --jq '[.assignees[].login] | join(",")' 2>/dev/null || echo ""
 )"
 
@@ -164,18 +158,17 @@ if [[ "${is_assigned}" != "true" ]]; then
   exit 0
 fi
 
-# --- Tracking label ---
 gh label create "${AUTO_ASSIGNED_LABEL}" \
   --repo "${REPO}" \
   --color "0E8A16" \
   --description "Assigned via /assign automation" \
   >/dev/null 2>&1 || true
 
-if ! gh issue edit "${ISSUE_NUMBER}" --repo "${REPO}" --add-label "${AUTO_ASSIGNED_LABEL}" >/dev/null 2>&1; then
+if ! gh issue edit "${ISSUE}" --repo "${REPO}" --add-label "${AUTO_ASSIGNED_LABEL}" >/dev/null 2>&1; then
   echo "   ⚠️ Failed to add ${AUTO_ASSIGNED_LABEL} label" >&2
 fi
 
-echo "✅ Assigned @${USER_LOGIN} to issue #${ISSUE_NUMBER}"
+echo "✅ Assigned @${USER_LOGIN} to issue #${ISSUE}"
 post_sticky_feedback "✅ Assigned @${USER_LOGIN} to this issue via \`/assign\` (${eligibility_reason}).
 
 Please open a linked PR within **2 weeks**, or the automation may unassign stale auto-assignments (maintainers are exempt)."
