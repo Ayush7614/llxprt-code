@@ -33,7 +33,7 @@ The `/dumpcontext` command captures complete API request/response data for debug
 
 ## Dump Location
 
-Dumps are saved to `~/.llxprt/dumps/` with filenames in the format:
+Dumps are saved to `<cache>/dumps/` (see [Application Directories](../reference/application-directories.md)) with filenames in the format:
 
 ```text
 YYYYMMDD-HHMMSS-<provider>-<random>.json
@@ -82,10 +82,12 @@ Dumps are OpenAI API compliant and can be replayed with curl. Since the dump inc
 ### Extract and Send Request
 
 ```bash
-# Extract the request body and send to the API
-jq '.request.body' ~/.llxprt/dumps/YOUR_DUMP.json > /tmp/body.json
+# Linux example: LLXPRT_CACHE_HOME -> LLXPRT_CONFIG_HOME -> Linux default.
+# See Application Directories for the macOS and Windows defaults.
+DUMPS="${LLXPRT_CACHE_HOME:-${LLXPRT_CONFIG_HOME:-$HOME/.cache/llxprt-code}}/dumps"
+jq '.request.body' "$DUMPS/YOUR_DUMP.json" > /tmp/body.json
 
-curl -X POST "$(jq -r '.request.url' ~/.llxprt/dumps/YOUR_DUMP.json)" \
+curl -X POST "$(jq -r '.request.url' "$DUMPS/YOUR_DUMP.json")" \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $OPENAI_API_KEY" \
   -d @/tmp/body.json
@@ -95,7 +97,7 @@ curl -X POST "$(jq -r '.request.url' ~/.llxprt/dumps/YOUR_DUMP.json)" \
 
 ```bash
 # Pipe the body directly to curl
-jq '.request.body' ~/.llxprt/dumps/YOUR_DUMP.json | \
+jq '.request.body' "$DUMPS/YOUR_DUMP.json" | \
   curl -X POST "https://api.openai.com/v1/chat/completions" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $OPENAI_API_KEY" \
@@ -108,7 +110,7 @@ For OpenAI-compatible providers (like local models or alternative endpoints):
 
 ```bash
 # Extract URL from dump and use with custom auth
-DUMP=~/.llxprt/dumps/YOUR_DUMP.json
+DUMP="$DUMPS/YOUR_DUMP.json"
 jq '.request.body' "$DUMP" | \
   curl -X POST "$(jq -r '.request.url' "$DUMP")" \
     -H "Content-Type: application/json" \
@@ -128,21 +130,21 @@ jq '{
   message_count: (.request.body.messages | length),
   tool_count: (.request.body.tools | length),
   response_status: .response.status
-}' ~/.llxprt/dumps/YOUR_DUMP.json
+}' "$DUMPS/YOUR_DUMP.json"
 ```
 
 ### Extract Conversation History
 
 ```bash
 # Show messages with roles
-jq '.request.body.messages[] | {role, content: .content[:100]}' ~/.llxprt/dumps/YOUR_DUMP.json
+jq '.request.body.messages[] | {role, content: .content[:100]}' "$DUMPS/YOUR_DUMP.json"
 ```
 
 ### List Available Tools
 
 ```bash
 # Show tool names and descriptions
-jq '.request.body.tools[] | {name: .function.name, description: .function.description[:50]}' ~/.llxprt/dumps/YOUR_DUMP.json
+jq '.request.body.tools[] | {name: .function.name, description: .function.description[:50]}' "$DUMPS/YOUR_DUMP.json"
 ```
 
 ### Check Response Details
@@ -152,7 +154,7 @@ jq '.request.body.tools[] | {name: .function.name, description: .function.descri
 jq '{
   finish_reason: .response.body.choices[0].finish_reason,
   usage: .response.body.usage
-}' ~/.llxprt/dumps/YOUR_DUMP.json
+}' "$DUMPS/YOUR_DUMP.json"
 ```
 
 ## Use Cases
@@ -218,9 +220,12 @@ See [Debug Logging](../debug-logging.md) for more information.
 - Consider redacting sensitive data before sharing dumps
 
 ```bash
-# Clean up old dumps
-rm ~/.llxprt/dumps/*.json
+# Clean up old dumps. This Linux example honors LLXPRT_CACHE_HOME, then
+# LLXPRT_CONFIG_HOME, then the Linux default; see Application Directories for
+# the macOS and Windows defaults.
+CACHE_DIR="${LLXPRT_CACHE_HOME:-${LLXPRT_CONFIG_HOME:-$HOME/.cache/llxprt-code}}"
+rm -f "${CACHE_DIR}/dumps/"*.json
 
 # Or keep only recent dumps
-find ~/.llxprt/dumps -name "*.json" -mtime +7 -delete
+find "${CACHE_DIR}/dumps" -name "*.json" -mtime +7 -delete
 ```

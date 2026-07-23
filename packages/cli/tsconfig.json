@@ -38,7 +38,6 @@
   },
   "include": [
     "index.ts",
-    "src/**/*.cts",
     "src/**/*.ts",
     "src/**/*.tsx",
     "src/**/*.d.ts",
