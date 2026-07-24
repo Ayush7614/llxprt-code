@@ -18,9 +18,9 @@ MARKER='<!-- llxprt-assign-feedback -->'
 AUTO_ASSIGNED_LABEL='auto-assigned'
 AUTO_ASSIGNED_COLOR='0E8A16'
 AUTO_ASSIGNED_DESC='Assigned via /assign automation'
-HISTORY_PREFIX='asnhist--'
-HISTORY_COLOR='0E8A16'
-HISTORY_DESC='Issue assignment history index'
+# Source shared history-label constants (policy values + login validation).
+# shellcheck source-path=SCRIPTDIR
+source "$(dirname "${BASH_SOURCE[0]}")/assign-constants.sh"
 MAX_ASSIGNMENTS=3
 BOT_LOGIN='github-actions[bot]'
 HISTORY_FILE="${ASSIGNMENT_HISTORY_FILE:-.github/assignment-history.txt}"
@@ -42,6 +42,20 @@ USER_LOGIN="${COMMENTER_LOGIN}"
 ISSUE="${ISSUE_NUMBER}"
 REPO="${GITHUB_REPOSITORY}"
 export ASSIGNEE_LOGIN="${USER_LOGIN}"
+
+ASSIGN_TEMP_DIR="$(mktemp -d)"
+MUTATION_STARTED=false
+LIFECYCLE_COMMITTED=false
+label_added_by_this_run=false
+
+# shellcheck disable=SC2329  # Invoked by EXIT/INT/TERM traps.
+cleanup_temp_files() {
+  if [[ -n "${ASSIGN_TEMP_DIR:-}" && -d "${ASSIGN_TEMP_DIR}" ]]; then
+    rm -rf -- "${ASSIGN_TEMP_DIR}"
+  fi
+}
+
+trap cleanup_temp_files EXIT
 export GITHUB_REPOSITORY="${REPO}"
 
 # ---------------------------------------------------------------------------
@@ -116,7 +130,7 @@ get_open_assigned_count() {
 get_merged_pr_count() {
   local user="$1"
   local _stderr_file raw
-  _stderr_file="$(mktemp)"
+  _stderr_file="$(mktemp "${ASSIGN_TEMP_DIR}/capture.XXXXXX")"
   raw="$(gh api "search/issues?q=repo:${REPO}+author:${user}+type:pr+is:merged&per_page=1" --jq '.' 2>"${_stderr_file}")" || {
     local _diag
     _diag="$(cat "${_stderr_file}" 2>/dev/null || true)"
@@ -164,7 +178,7 @@ has_history_label() {
   local user="$1"
   local label_name="${HISTORY_PREFIX}${user}"
   local _stderr_file raw
-  _stderr_file="$(mktemp)"
+  _stderr_file="$(mktemp "${ASSIGN_TEMP_DIR}/capture.XXXXXX")"
   raw="$(gh api "repos/${REPO}/labels/${label_name}" --jq '.' 2>"${_stderr_file}")" || {
     local _diag
     _diag="$(cat "${_stderr_file}" 2>/dev/null || true)"
@@ -219,7 +233,7 @@ validate_label_definition() {
   local expected_color="$2"
   local expected_desc="$3"
   local _stderr_file raw
-  _stderr_file="$(mktemp)"
+  _stderr_file="$(mktemp "${ASSIGN_TEMP_DIR}/capture.XXXXXX")"
   raw="$(gh api "repos/${REPO}/labels/${label_name}" --jq '.' 2>"${_stderr_file}")" || {
     local _diag
     _diag="$(cat "${_stderr_file}" 2>/dev/null || true)"
@@ -310,7 +324,7 @@ remove_label() {
   local issue_num="$1"
   local label_name="$2"
   local encoded
-  encoded="$(printf '%s' "${label_name}" | jq -sRr '@uri' | sed 's/%0A$//;s/%0a$//')"
+  encoded="$(printf '%s' "${label_name}" | jq -sRr '@uri')"
   gh api --method DELETE "repos/${REPO}/issues/${issue_num}/labels/${encoded}" \
     --silent >/dev/null 2>&1
 }
@@ -326,60 +340,163 @@ remove_label() {
 # NOT treat a failed rollback as success.
 # ---------------------------------------------------------------------------
 
+rollback_ownership_from_snapshot() {
+  local assignees_json="$1"
+  local timeline_json="$2"
+  local login="$3"
+
+  echo "${timeline_json}" | jq -r \
+    --argjson current_assignees "${assignees_json}" \
+    --arg login "${login}" \
+    --arg bot "${BOT_LOGIN}" '
+      if type != "array" then error("timeline is not an array") else . end
+      | to_entries as $entries
+      | ($entries | map(select(
+          (.value.event == "assigned" or .value.event == "unassigned") and
+          (.value.assignee | type == "object") and
+          .value.assignee.login == $login
+        ))) as $transitions
+      | if ($current_assignees | map(.login) | index($login)) == null then
+          "ABSENT"
+        else
+          ($transitions | map(select(.value.assignee.login == $login)) | last // null) as $latest
+          | if $latest != null and
+               $latest.value.event == "assigned" and
+               ($latest.value.actor.login // "") == $bot then
+              "BOT \($latest.key) \($entries | length)"
+            else
+              "PRESERVE"
+            end
+        end
+    ' 2>/dev/null
+}
+
+marker_removal_is_safe() {
+  local assignees_json="$1"
+  local timeline_json="$2"
+
+  echo "${timeline_json}" | jq -e \
+    --argjson current_assignees "${assignees_json}" \
+    --arg bot "${BOT_LOGIN}" '
+      if type != "array" then error("timeline is not an array") else . end
+      | to_entries
+      | map(select(.value.event == "assigned" or .value.event == "unassigned")) as $transitions
+      | [$current_assignees[].login as $login
+          | ($transitions | map(select(
+              (.value.assignee | type == "object") and
+              .value.assignee.login == $login
+            )) | last // null) as $latest
+          | $latest != null and
+            $latest.value.event == "assigned" and
+            ($latest.value.actor.login // "") != "" and
+            $latest.value.actor.login != $bot
+        ] | all
+    ' >/dev/null 2>&1
+}
+
+human_takeover_before_rollback_unassign() {
+  local timeline_json="$1"
+  local login="$2"
+  local bot_assignment_pos="$3"
+  local snapshot_length="$4"
+
+  echo "${timeline_json}" | jq -e \
+    --arg login "${login}" \
+    --arg bot "${BOT_LOGIN}" \
+    --argjson bot_pos "${bot_assignment_pos}" \
+    --argjson snapshot_length "${snapshot_length}" '
+      to_entries as $entries
+      | ($entries | map(select(
+          .key >= $snapshot_length and
+          .value.event == "unassigned" and
+          .value.assignee.login == $login and
+          .value.actor.login == $bot
+        )) | first // null) as $cleanup_unassign
+      | $cleanup_unassign != null and
+        any($entries[];
+          .key > $bot_pos and
+          .key < $cleanup_unassign.key and
+          .value.event == "assigned" and
+          .value.assignee.login == $login and
+          (.value.actor.login // "") != $bot
+        )
+    ' >/dev/null 2>&1
+}
+
 rollback_this_run() {
   local issue_num="$1"
   local login="$2"
   local label_name="$3"
-  local rolled_label="${4:-false}"  # whether this run added the label
+  local rolled_label="${4:-false}"
+  local assignees_json timeline_json ownership
 
-  # Remove this run's assignee (best-effort; DELETE may be a no-op if
-  # already gone, which is fine).
-  remove_assignee "${issue_num}" "${login}" || true
-
-  # Re-read exact assignee JSON after removal.
-  local post_assignees_json
-  if ! post_assignees_json="$(get_issue_assignees_json 2>/dev/null)"; then
-    echo "‼ Rollback: failed to re-read assignees after removing @${login} on #${issue_num}" >&2
-    # If we can't verify, leave the label for safety (diagnosable state).
+  if ! assignees_json="$(get_issue_assignees_json 2>/dev/null)" ||
+     ! timeline_json="$(fetch_timeline_json)" ||
+     ! ownership="$(rollback_ownership_from_snapshot "${assignees_json}" "${timeline_json}" "${login}")"; then
+    echo "‼ Rollback: failed to establish authoritative ownership for @${login} on #${issue_num}" >&2
     return 1
   fi
 
-  # Check if this login is still present (DELETE may have failed or was
-  # re-added by a post-handler race).
-  local still_assigned
-  still_assigned="$(echo "${post_assignees_json}" | jq -r --arg login "${login}" \
-    '[.[].login] | index($login) != null')"
-
-  if [[ "${still_assigned}" == "true" ]]; then
-    # Assignee DELETE did not take effect (or was re-added). Retain marker
-    # for next-run recovery and fail.
-    echo "‼ Rollback verification FAILED: @${login} still assigned to #${issue_num}" >&2
-    return 1
-  fi
-
-  # Count remaining assignees.
-  local remaining_count
-  remaining_count="$(echo "${post_assignees_json}" | jq 'length')"
-
-  # Decide whether to remove the label.
-  # If other assignees remain (competing winner), preserve the marker.
-  if [[ "${remaining_count}" -gt 0 ]]; then
-    # A competing winner is still assigned — preserve the marker.
-    return 0
-  fi
-
-  # No other assignee remains; this run owned the marker. Remove the label.
-  if [[ "${rolled_label}" == "true" ]]; then
-    remove_label "${issue_num}" "${label_name}" || true
-    local verify_labels
-    if ! verify_labels="$(get_issue_labels_json 2>/dev/null)"; then
-      echo "‼ Rollback: failed to verify label removal on #${issue_num}" >&2
+  if [[ "${ownership}" == BOT\ * ]]; then
+    local bot_assignment_pos snapshot_length
+    read -r _ bot_assignment_pos snapshot_length <<<"${ownership}"
+    if ! remove_assignee "${issue_num}" "${login}"; then
+      echo "‼ Rollback: targeted DELETE failed for @${login} on #${issue_num}" >&2
       return 1
     fi
-    if echo "${verify_labels}" | jq -e --arg lbl "${label_name}" \
-      '[.[].name] | index($lbl) != null' >/dev/null 2>&1; then
-      echo "‼ Rollback verification FAILED: label '${label_name}' still on #${issue_num}" >&2
+
+    if ! assignees_json="$(get_issue_assignees_json 2>/dev/null)" ||
+       ! timeline_json="$(fetch_timeline_json)"; then
+      echo "‼ Rollback: failed to verify targeted DELETE for @${login} on #${issue_num}" >&2
       return 1
+    fi
+
+    if human_takeover_before_rollback_unassign "${timeline_json}" "${login}" "${bot_assignment_pos}" "${snapshot_length}"; then
+      add_assignee "${issue_num}" "${login}" || true
+      if ! assignees_json="$(get_issue_assignees_json 2>/dev/null)" ||
+         ! echo "${assignees_json}" | jq -e --arg login "${login}" '[.[].login] | index($login) != null' >/dev/null 2>&1; then
+        echo "‼ Rollback compensation FAILED for human-owned @${login} on #${issue_num}" >&2
+      else
+        echo "‼ Rollback detected a concurrent human takeover of @${login}; restored assignee and retained marker" >&2
+      fi
+      return 1
+    fi
+
+    if echo "${assignees_json}" | jq -e --arg login "${login}" '[.[].login] | index($login) != null' >/dev/null 2>&1; then
+      echo "‼ Rollback verification FAILED: @${login} still assigned to #${issue_num}" >&2
+      return 1
+    fi
+  elif [[ "${ownership}" == "PRESERVE" ]]; then
+    echo "Rollback: preserving human/unknown-owned @${login} on #${issue_num}" >&2
+  elif [[ "${ownership}" != "ABSENT" ]]; then
+    echo "‼ Rollback: ambiguous ownership result for @${login} on #${issue_num}" >&2
+    return 1
+  fi
+
+  local preserve_marker_for_bot_contender=false
+  if echo "${assignees_json}" | jq -e --arg login "${login}" \
+    'any(.[]; .login != $login)' >/dev/null 2>&1; then
+    preserve_marker_for_bot_contender=true
+  fi
+
+  if [[ "${rolled_label}" == "true" ]]; then
+    if ! assignees_json="$(get_issue_assignees_json 2>/dev/null)" ||
+       ! timeline_json="$(fetch_timeline_json)"; then
+      echo "‼ Rollback: failed to verify marker ownership on #${issue_num}" >&2
+      return 1
+    fi
+    if [[ "${preserve_marker_for_bot_contender}" != "true" ]] &&
+       marker_removal_is_safe "${assignees_json}" "${timeline_json}"; then
+      remove_label "${issue_num}" "${label_name}" || true
+      local verify_labels
+      if ! verify_labels="$(get_issue_labels_json 2>/dev/null)"; then
+        echo "‼ Rollback: failed to verify label removal on #${issue_num}" >&2
+        return 1
+      fi
+      if echo "${verify_labels}" | jq -e --arg lbl "${label_name}" '[.[].name] | index($lbl) != null' >/dev/null 2>&1; then
+        echo "‼ Rollback verification FAILED: label '${label_name}' still on #${issue_num}" >&2
+        return 1
+      fi
     fi
   fi
   return 0
@@ -388,7 +505,12 @@ rollback_this_run() {
 # Verified rollback that exits nonzero if rollback itself fails.
 # Never treats a failed rollback as success. If rollback fails, the
 # state is left diagnosable (assignee/label may remain for next run).
-# Args: issue_num login label_name rolled_label feedback_msg exit_code
+#
+# On SUCCESSFUL rollback, posts feedback only when post_feedback_on_success
+# is "true". Contention-loser callers pass "false" to avoid overwriting the
+# winner's sticky.
+#
+# Args: issue_num login label_name rolled_label feedback_msg exit_code [post_feedback_on_success]
 verified_rollback_and_fail() {
   local issue_num="$1"
   local login="$2"
@@ -396,12 +518,35 @@ verified_rollback_and_fail() {
   local rolled_label="$4"
   local feedback_msg="$5"
   local exit_code="${6:-1}"
+  local post_feedback_on_success="${7:-true}"
 
   if ! rollback_this_run "${issue_num}" "${login}" "${label_name}" "${rolled_label}"; then
     echo "‼ Rollback FAILED for @${login} on #${issue_num} — state left for diagnosis" >&2
     post_sticky_feedback "${feedback_msg}" || true
     exit "${exit_code}"
   fi
+
+  if [[ "${post_feedback_on_success}" == "true" ]]; then
+    post_sticky_feedback "${feedback_msg}" || true
+  fi
+  exit "${exit_code}"
+}
+
+# shellcheck disable=SC2329  # Invoked by INT/TERM traps.
+handle_lifecycle_signal() {
+  local signal_name="$1"
+  local exit_code="$2"
+  trap - INT TERM
+  echo "‼ Received ${signal_name} during assignment lifecycle for @${USER_LOGIN} on #${ISSUE}" >&2
+  if [[ "${MUTATION_STARTED}" == "true" && "${LIFECYCLE_COMMITTED}" != "true" ]]; then
+    if rollback_this_run "${ISSUE}" "${USER_LOGIN}" "${AUTO_ASSIGNED_LABEL}" "${label_added_by_this_run}"; then
+      echo "Rollback completed after ${signal_name}" >&2
+    else
+      echo "‼ Rollback after ${signal_name} could not be verified; recoverable marker state was retained" >&2
+    fi
+  fi
+  cleanup_temp_files
+  exit "${exit_code}"
 }
 
 # ---------------------------------------------------------------------------
@@ -446,17 +591,29 @@ elect_winner() {
     if type != "array" then error("timeline is not an array") else . end
     | to_entries as $all_entries
     | ($all_entries | map(select(.value.event == "assigned" or .value.event == "unassigned"))) as $assign_entries
+    | ($assign_entries | map(
+        select(
+          (.value.assignee | type == "object")
+          and (.value.assignee.login | type == "string")
+          and (.value.assignee.login | length > 0)
+        )
+      )) as $valid_assign_entries
+    | ($assign_entries | length) as $total_assign_entries
+    | ($valid_assign_entries | length) as $valid_count
+    | if $total_assign_entries > $valid_count then
+        error("malformed assignee data in timeline transition events")
+      else . end
     | ($current_assignees | map(.login)) as $logins
     | [
         $logins[]
         | . as $login
-        | ($assign_entries | map(select(.value.assignee.login == $login))) as $login_transitions
+        | ($valid_assign_entries | map(select(.value.assignee.login == $login))) as $login_transitions
         | ($login_transitions | last // null) as $last_entry
         | if $last_entry != null then
             {
               login: $login,
               pos: $last_entry.key,
-              actor: $last_entry.value.actor.login,
+              actor: ($last_entry.value.actor.login // "unknown"),
               event: $last_entry.value.event
             }
           else
@@ -555,7 +712,7 @@ post_sticky_feedback() {
   body="$(printf '%s\n%s\n' "${MARKER}" "${message}")"
 
   local _comments_stderr_file
-  _comments_stderr_file="$(mktemp)"
+  _comments_stderr_file="$(mktemp "${ASSIGN_TEMP_DIR}/capture.XXXXXX")"
   local all_comments_raw
   all_comments_raw="$(gh api "repos/${REPO}/issues/${ISSUE}/comments" --paginate 2>"${_comments_stderr_file}")" || {
     echo "‼ Failed to fetch comments for feedback" >&2
@@ -566,21 +723,32 @@ post_sticky_feedback() {
   rm -f "${_comments_stderr_file}"
 
   local all_comment_ids
-  all_comment_ids="$(echo "${all_comments_raw}" | jq -s 'add | [(.[]? | select(.user.login == $bot and ((.body // "") | startswith($marker))) | .id)]' \
+  all_comment_ids="$(echo "${all_comments_raw}" | jq -s 'add | [(.[]? | select(.user.login == $bot and ((.body // "") | startswith($marker))) | .id)] | sort' \
     --arg bot "${BOT_LOGIN}" --arg marker "${MARKER}")" || {
     echo "‼ Failed to parse comments for feedback" >&2
     return 1
   }
 
-  local existing_id
-  existing_id="$(echo "${all_comment_ids}" | jq -r 'if type == "array" then .[0] // empty else empty end')"
+  local count
+  count="$(echo "${all_comment_ids}" | jq 'length')"
 
-  if [[ -n "${existing_id}" ]]; then
-    gh api --method PATCH "repos/${REPO}/issues/comments/${existing_id}" \
-      -f body="${body}" --silent >/dev/null 2>&1 || return 1
-  else
+  if [[ "${count}" -eq 0 ]]; then
     gh api --method POST "repos/${REPO}/issues/${ISSUE}/comments" \
       -f body="${body}" --silent >/dev/null 2>&1 || return 1
+    return 0
+  fi
+
+  local keep_id
+  keep_id="$(echo "${all_comment_ids}" | jq -r '.[-1]')"
+
+  gh api --method PATCH "repos/${REPO}/issues/comments/${keep_id}" \
+    -f body="${body}" --silent >/dev/null 2>&1 || return 1
+
+  if [[ "${count}" -gt 1 ]]; then
+    echo "${all_comment_ids}" | jq -r '.[:-1][]' | while IFS= read -r dup_id; do
+      gh api --method DELETE "repos/${REPO}/issues/comments/${dup_id}" \
+        --silent >/dev/null 2>&1 || true
+    done
   fi
 }
 
@@ -717,7 +885,9 @@ if [[ "${pre_open_count}" -ge "${MAX_ASSIGNMENTS}" ]]; then
 fi
 
 # Step 5: Add auto-assigned label (targeted POST).
-label_added_by_this_run=false
+MUTATION_STARTED=true
+trap 'handle_lifecycle_signal INT 130' INT
+trap 'handle_lifecycle_signal TERM 143' TERM
 
 if add_label "${ISSUE}" "${AUTO_ASSIGNED_LABEL}"; then
   label_added_by_this_run=true
@@ -737,7 +907,6 @@ if ! add_assignee "${ISSUE}" "${USER_LOGIN}"; then
   echo "‼ Assignee POST failed for #${ISSUE}" >&2
   verified_rollback_and_fail "${ISSUE}" "${USER_LOGIN}" "${AUTO_ASSIGNED_LABEL}" "${label_added_by_this_run}" \
     "[ERROR] Could not assign @${USER_LOGIN}: GitHub API error during assignment. Please try again or contact a maintainer." 1
-  exit 1
 fi
 
 # Step 7: Deterministic winner election via authoritative paginated timeline.
@@ -751,7 +920,6 @@ SHOULD_ROLLBACK="false"
 if ! run_election; then
   verified_rollback_and_fail "${ISSUE}" "${USER_LOGIN}" "${AUTO_ASSIGNED_LABEL}" "${label_added_by_this_run}" \
     "[ERROR] Could not assign @${USER_LOGIN}: election verification failed. Please contact a maintainer." 1
-  exit 1
 fi
 
 if [[ "${SHOULD_ROLLBACK}" == "true" ]]; then
@@ -760,9 +928,8 @@ if [[ "${SHOULD_ROLLBACK}" == "true" ]]; then
       "[ERROR] Could not assign @${USER_LOGIN}: a human has taken ownership of this issue." 1
   else
     verified_rollback_and_fail "${ISSUE}" "${USER_LOGIN}" "${AUTO_ASSIGNED_LABEL}" "${label_added_by_this_run}" \
-      "[ERROR] Could not assign @${USER_LOGIN}: another assignment was selected. Please try a different issue." 1
+      "[ERROR] Could not assign @${USER_LOGIN}: another assignment was selected. Please try a different issue." 1 false
   fi
-  exit 1
 fi
 
 # Winner enforcement: wait/retry for losers to rollback, then verify
@@ -776,7 +943,6 @@ for _e_attempt in $(seq 1 $((enforcement_retries + 1))); do
     echo "‼ Failed to verify assignees for #${ISSUE}" >&2
     verified_rollback_and_fail "${ISSUE}" "${USER_LOGIN}" "${AUTO_ASSIGNED_LABEL}" "${label_added_by_this_run}" \
       "[ERROR] Could not assign @${USER_LOGIN}: unable to verify assignment state. Please contact a maintainer." 1
-    exit 1
   fi
 
   assignee_count="$(echo "${verified_assignees_json}" | jq 'length')"
@@ -792,8 +958,7 @@ for _e_attempt in $(seq 1 $((enforcement_retries + 1))); do
   if [[ "${has_commenter}" != "true" ]]; then
     echo "WARNING: @${USER_LOGIN} no longer assigned to #${ISSUE} during enforcement" >&2
     verified_rollback_and_fail "${ISSUE}" "${USER_LOGIN}" "${AUTO_ASSIGNED_LABEL}" "${label_added_by_this_run}" \
-      "[ERROR] Could not assign @${USER_LOGIN}: another assignment was selected. Please try a different issue." 1
-    exit 1
+      "[ERROR] Could not assign @${USER_LOGIN}: another assignment was selected. Please try a different issue." 1 false
   fi
 
   recheck_timeline=""
@@ -804,28 +969,24 @@ for _e_attempt in $(seq 1 $((enforcement_retries + 1))); do
     echo "‼ Enforcement re-election: API error for #${ISSUE}" >&2
     verified_rollback_and_fail "${ISSUE}" "${USER_LOGIN}" "${AUTO_ASSIGNED_LABEL}" "${label_added_by_this_run}" \
       "[ERROR] Could not assign @${USER_LOGIN}: election verification failed. Please contact a maintainer." 1
-    exit 1
   fi
 
   if ! recheck_winner="$(elect_winner "${recheck_assignees}" "${recheck_timeline}")"; then
     echo "‼ Enforcement re-election: error for #${ISSUE}" >&2
     verified_rollback_and_fail "${ISSUE}" "${USER_LOGIN}" "${AUTO_ASSIGNED_LABEL}" "${label_added_by_this_run}" \
       "[ERROR] Could not assign @${USER_LOGIN}: election verification failed. Please contact a maintainer." 1
-    exit 1
   fi
 
   if [[ -z "${recheck_winner}" ]]; then
     echo "WARNING: Human ownership detected during enforcement on #${ISSUE}; rolling back @${USER_LOGIN}" >&2
     verified_rollback_and_fail "${ISSUE}" "${USER_LOGIN}" "${AUTO_ASSIGNED_LABEL}" "${label_added_by_this_run}" \
       "[ERROR] Could not assign @${USER_LOGIN}: a human has taken ownership of this issue." 1
-    exit 1
   fi
 
   if [[ "${recheck_winner}" != "${USER_LOGIN}" ]]; then
     echo "WARNING: @${USER_LOGIN} is no longer the winner (@${recheck_winner} won) on #${ISSUE}" >&2
     verified_rollback_and_fail "${ISSUE}" "${USER_LOGIN}" "${AUTO_ASSIGNED_LABEL}" "${label_added_by_this_run}" \
-      "[ERROR] Could not assign @${USER_LOGIN}: another assignment was selected. Please try a different issue." 1
-    exit 1
+      "[ERROR] Could not assign @${USER_LOGIN}: another assignment was selected. Please try a different issue." 1 false
   fi
 
   if [[ "${_e_attempt}" -le "${enforcement_retries}" ]]; then
@@ -836,8 +997,7 @@ done
 if [[ "${enforcement_ok}" != "true" ]]; then
   echo "WARNING: Post-election contention on #${ISSUE}: assignees = $(echo "${verified_assignees_json}" | jq -r '[.[].login] | join(", ")')" >&2
   verified_rollback_and_fail "${ISSUE}" "${USER_LOGIN}" "${AUTO_ASSIGNED_LABEL}" "${label_added_by_this_run}" \
-    "[ERROR] Could not assign @${USER_LOGIN}: unable to enforce single-winner assignment. Please contact a maintainer." 1
-  exit 1
+    "[ERROR] Could not assign @${USER_LOGIN}: unable to enforce single-winner assignment. Please contact a maintainer." 1 false
 fi
 
 # Step 8: Verify label was added.
@@ -845,14 +1005,12 @@ verified_labels_json=""
 if ! verified_labels_json="$(get_issue_labels_json)"; then
   verified_rollback_and_fail "${ISSUE}" "${USER_LOGIN}" "${AUTO_ASSIGNED_LABEL}" "${label_added_by_this_run}" \
     "[ERROR] Could not assign @${USER_LOGIN}: unable to verify label state. Please contact a maintainer." 1
-  abort_infra_error "‼ Failed to verify labels for #${ISSUE}"
 fi
 
 if ! echo "${verified_labels_json}" | jq -e --arg lbl "${AUTO_ASSIGNED_LABEL}" '[.[].name] | index($lbl) != null' >/dev/null 2>&1; then
   echo "‼ Label verification failed for #${ISSUE}" >&2
   verified_rollback_and_fail "${ISSUE}" "${USER_LOGIN}" "${AUTO_ASSIGNED_LABEL}" "${label_added_by_this_run}" \
     "[ERROR] Could not assign @${USER_LOGIN}: the label could not be verified. Please contact a maintainer." 1
-  exit 1
 fi
 
 # Step 9: Post-mutation cap enforcement (fail-closed).
@@ -861,7 +1019,6 @@ if ! post_open_count="$(get_open_assigned_count "${USER_LOGIN}")"; then
   echo "‼ Post-mutation cap query failed for @${USER_LOGIN}" >&2
   verified_rollback_and_fail "${ISSUE}" "${USER_LOGIN}" "${AUTO_ASSIGNED_LABEL}" "${label_added_by_this_run}" \
     "[ERROR] Could not assign @${USER_LOGIN}: unable to verify the assignment cap due to an API error. Please try again or contact a maintainer." 1
-  exit 1
 fi
 
 if [[ "${post_open_count}" -gt "${MAX_ASSIGNMENTS}" ]]; then
@@ -869,7 +1026,6 @@ if [[ "${post_open_count}" -gt "${MAX_ASSIGNMENTS}" ]]; then
   # Verified rollback must succeed before exiting. If it fails, exit nonzero.
   verified_rollback_and_fail "${ISSUE}" "${USER_LOGIN}" "${AUTO_ASSIGNED_LABEL}" "${label_added_by_this_run}" \
     "[ERROR] Could not assign @${USER_LOGIN}: assignment would exceed the **${MAX_ASSIGNMENTS}**-issue cap. Another assignment may have completed concurrently." 1
-  exit 0
 fi
 
 # Step 10: Create durable history label directly (GitHub suppresses recursive
@@ -880,8 +1036,10 @@ if ! bash "$(dirname "${BASH_SOURCE[0]}")/record-assignment-history.sh"; then
   echo "‼ Failed to create history label for @${USER_LOGIN}" >&2
   verified_rollback_and_fail "${ISSUE}" "${USER_LOGIN}" "${AUTO_ASSIGNED_LABEL}" "${label_added_by_this_run}" \
     "[ERROR] Could not assign @${USER_LOGIN}: failed to record assignment history. Please try again or contact a maintainer." 1
-  exit 1
 fi
+
+LIFECYCLE_COMMITTED=true
+trap - INT TERM
 
 echo "[OK] Assigned @${USER_LOGIN} to issue #${ISSUE}"
 post_sticky_feedback "[OK] Assigned @${USER_LOGIN} to this issue via \`/assign\` (${eligibility_reason}).

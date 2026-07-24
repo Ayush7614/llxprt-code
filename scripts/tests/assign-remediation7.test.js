@@ -403,7 +403,6 @@ function setupConcurrencyRepo(initialState) {
  * POST assignee). The winner election must converge deterministically.
  */
 function spawnAssignProcess({
-  dir: _dir,
   stateFile,
   pathWithFakeGh,
   issueNumber,

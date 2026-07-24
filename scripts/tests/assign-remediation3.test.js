@@ -31,6 +31,8 @@ import {
   makeIssue,
   makePR,
   makeAssignedEvent,
+  makeLabeledEvent,
+  makeUnlabeledEvent,
   daysAgo,
   failOnNth,
 } from './assign-helpers.js';
@@ -43,42 +45,6 @@ const AUTO_LABEL_COLOR = '0E8A16';
 
 function defaultStateWith(overrides) {
   return { ...defaultState(), ...overrides };
-}
-
-function makeLabeledEvent({
-  number: _n,
-  label = 'auto-assigned',
-  actor = 'github-actions[bot]',
-  createdAt = '2025-07-01T00:00:00Z',
-}) {
-  return {
-    id: Math.floor(Math.random() * 100000),
-    event: 'labeled',
-    actor: {
-      login: actor,
-      type: actor.endsWith('[bot]') ? 'Bot' : 'User',
-    },
-    label: { name: label },
-    created_at: createdAt,
-  };
-}
-
-function makeUnlabeledEvent({
-  number: _n,
-  label = 'auto-assigned',
-  actor = 'github-actions[bot]',
-  createdAt = '2025-07-02T00:00:00Z',
-}) {
-  return {
-    id: Math.floor(Math.random() * 100000),
-    event: 'unlabeled',
-    actor: {
-      login: actor,
-      type: actor.endsWith('[bot]') ? 'Bot' : 'User',
-    },
-    label: { name: label },
-    created_at: createdAt,
-  };
 }
 
 // ===========================================================================
@@ -382,15 +348,17 @@ describe('4: Final cap read fail-closed', () => {
 });
 
 // ===========================================================================
-// 5: No concurrency coalescing
+// 5: Per-actor concurrency serialization
 // ===========================================================================
 
-describe('5: No concurrency coalescing', () => {
-  it('assign job has NO concurrency block in assign.yml', () => {
+describe('5: Per-actor concurrency serialization', () => {
+  it('uses the stable commenter ID without issue number and does not cancel', () => {
     const source = readRootFile('.github/workflows/assign.yml');
     const workflow = yaml.load(source);
-    // The assign job must NOT have a concurrency key at all
-    expect(workflow.jobs.assign.concurrency).toBeUndefined();
+    expect(workflow.jobs.assign.concurrency).toEqual({
+      group: 'assign-${{ github.event.comment.user.id }}',
+      'cancel-in-progress': false,
+    });
   });
 
   it('assign.yml has no mention of concurrency coalescing', () => {
@@ -440,6 +408,8 @@ describe('5: No concurrency coalescing', () => {
 
     const result = repo.runAssign({ issueNumber: 42, commenter: 'alice' });
 
+    // Contention detected → nonzero exit
+    expect(result.status).not.toBe(0);
     // alice must be rolled back (contention detected)
     expect(result.state.issues['42']._assignees).not.toContain('alice');
     // The concurrent assignee remains (not our responsibility to remove)

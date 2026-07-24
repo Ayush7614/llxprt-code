@@ -64,8 +64,11 @@ describe('.github/workflows/assign.yml', () => {
     );
   });
 
-  it('assign job has NO concurrency block (postconditions handle races)', () => {
-    expect(job.concurrency).toBeUndefined();
+  it('serializes attempts per stable actor ID without cancelling in progress', () => {
+    expect(job.concurrency).toEqual({
+      group: 'assign-${{ github.event.comment.user.id }}',
+      'cancel-in-progress': false,
+    });
   });
 
   it('passes env vars and runs the script', () => {

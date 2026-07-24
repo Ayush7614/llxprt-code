@@ -34,6 +34,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import urllib.parse
 
 try:
@@ -360,6 +361,30 @@ def _apply_side_effect_action(state, se):
         issue["_assignees"] = issue.get("_assignees", [])
         if a not in issue["_assignees"]:
             issue["_assignees"].append(a)
+    elif action == "unassign_reassign" and issue is not None:
+        a = se["assignee"]
+        actor = se.get("actor", "concurrent-user")
+        if a in issue.get("_assignees", []):
+            issue["_assignees"] = [login for login in issue["_assignees"] if login != a]
+            _add_timeline_event(state, se.get("issue"), {
+                "event": "unassigned",
+                "actor": {"login": actor, "type": "User"},
+                "assignee": {"login": a},
+                "created_at": state.get("now", "2025-07-23T00:00:00Z"),
+            })
+        issue.setdefault("_assignees", []).append(a)
+        _add_timeline_event(state, se.get("issue"), {
+            "event": "assigned",
+            "actor": {"login": actor, "type": "User"},
+            "assignee": {"login": a},
+            "created_at": state.get("now", "2025-07-23T00:00:00Z"),
+        })
+    elif action == "pause":
+        hook_file = se.get("hook_file")
+        if hook_file:
+            with open(hook_file, "w") as f:
+                f.write("paused\n")
+        time.sleep(float(se.get("seconds", 1)))
     elif action == "remove_label" and issue is not None:
         lbl = se["label"]
         issue["_label_names"] = [
@@ -632,7 +657,7 @@ def handle_get(state, base_path, params, do_paginate):
             if label_filter:
                 wanted = set(label_filter.split(","))
                 have = set(issue.get("_label_names", []))
-                if not wanted.intersection(have):
+                if not wanted.issubset(have):
                     continue
             results.append(issue_to_api(issue, state))
         # GitHub /issues includes PRs too (unless filtered by query)
@@ -650,7 +675,7 @@ def handle_get(state, base_path, params, do_paginate):
             if label_filter:
                 wanted = set(label_filter.split(","))
                 have = set(pr.get("_label_names", []))
-                if not wanted.intersection(have):
+                if not wanted.issubset(have):
                     continue
             results.append(pr_to_issue_api(pr, state))
         return results
@@ -1034,6 +1059,17 @@ def handle_delete(state, base_path, body):
         save_state(state)
         return issue_to_api(issue, state)
 
+    m = re.match(rf"^{REPO_PREFIX}/issues/comments/(\d+)$", base_path)
+    if m:
+        cid = int(m.group(1))
+        comments = state.get("comments", [])
+        for i, c in enumerate(comments):
+            if c["id"] == cid:
+                del comments[i]
+                save_state(state)
+                return ""
+        die(f"HTTP 404: Comment {cid} not found", 1)
+
     die(f"HTTP 404: Unknown DELETE endpoint: {base_path}", 1)
 
 
@@ -1116,9 +1152,12 @@ def _process_request(method, base_path, params, body, do_paginate, jq_filter, si
 
     # Check failure injection (method + endpoint + nth aware)
     should_fail, fail_info = check_fail(state, method, base_path)
+    applied_failure = False
     if should_fail:
         fail_type = fail_info.get("type", "error") if isinstance(fail_info, dict) else fail_info
         http_status = fail_info.get("http_status") if isinstance(fail_info, dict) else None
+        applied_failure = fail_type == "applied_error"
+    if should_fail and not applied_failure:
         log_operation(state, method, base_path, "failed")
         save_state(state)
         if fail_type == "malformed":
@@ -1168,6 +1207,20 @@ def _process_request(method, base_path, params, body, do_paginate, jq_filter, si
 
     # Apply post-handler side effects (after state was mutated by this request)
     apply_post_side_effects(state, method, base_path)
+
+    if applied_failure:
+        state = load_state()
+        log_operation(state, method, base_path, "failed_after_apply")
+        save_state(state)
+        status = http_status or 500
+        die(
+            json.dumps({
+                "message": "Server Error",
+                "documentation_url": "",
+                "status": str(status),
+            }),
+            1,
+        )
 
     # Emit configured stderr warnings (simulates gh CLI writing to stderr
     # while still returning valid JSON on stdout — e.g. deprecation notices).

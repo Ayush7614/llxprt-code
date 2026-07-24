@@ -33,6 +33,19 @@ fi
 
 REPO="${GITHUB_REPOSITORY}"
 
+CLEANUP_TEMP_DIR="$(mktemp -d)"
+
+# shellcheck disable=SC2329  # Invoked by EXIT/INT/TERM traps.
+cleanup_temp_files() {
+  if [[ -n "${CLEANUP_TEMP_DIR:-}" && -d "${CLEANUP_TEMP_DIR}" ]]; then
+    rm -rf -- "${CLEANUP_TEMP_DIR}"
+  fi
+}
+
+trap cleanup_temp_files EXIT
+trap 'cleanup_temp_files; trap - EXIT; exit 130' INT
+trap 'cleanup_temp_files; trap - EXIT; exit 143' TERM
+
 retry_gh() {
   local attempt
   for attempt in 1 2 3 4; do
@@ -74,12 +87,44 @@ iso_to_epoch() {
   date -u -j -f "%Y-%m-%dT%H:%M:%S" "${normalized}" +%s 2>/dev/null
 }
 
+# Run a command with bounded retry, capturing combined stdout.
+# Sets the global RETRY_CAPTURE_OUT on success. Returns 0 on success, 1 on
+# exhaustion. Stderr from the command is suppressed (goes to /dev/null).
+# Args: command...
+retry_gh_capture() {
+  local _capture_file
+  _capture_file="$(mktemp "${CLEANUP_TEMP_DIR}/capture.XXXXXX")"
+  local attempt
+  for attempt in 1 2 3 4; do
+    : >"${_capture_file}"
+    if "$@" >"${_capture_file}" 2>/dev/null; then
+      RETRY_CAPTURE_OUT="$(cat "${_capture_file}")"
+      rm -f "${_capture_file}"
+      return 0
+    fi
+    if [[ "${attempt}" -lt 4 ]]; then
+      echo "Attempt ${attempt} failed, retrying: $*" >&2
+      sleep "${ASSIGN_RETRY_DELAY}"
+    fi
+  done
+  rm -f "${_capture_file}"
+  echo "All retries exhausted for: $*" >&2
+  return 1
+}
+
 # gh api --paginate emits one JSON array per page; jq -s merges them.
+# Uses retry_gh_capture for bounded retry on transient failures. The gh call
+# and jq merge are run as a single bash -c with pipefail so that a gh failure
+# (nonzero exit, empty stdout) is detected even though jq succeeds on empty
+# input. Stdout is captured cleanly without stderr corruption.
 fetch_issue_timeline() {
   local issue_number="$1"
-  gh api "repos/${REPO}/issues/${issue_number}/timeline?per_page=100" \
-    --paginate 2>/dev/null \
-    | jq -s 'if all(.[]; type == "array") then add else error("non-array page in timeline") end'
+  local _raw_pages
+  if ! retry_gh_capture gh api "repos/${REPO}/issues/${issue_number}/timeline?per_page=100" --paginate; then
+    return 1
+  fi
+  _raw_pages="${RETRY_CAPTURE_OUT}"
+  printf '%s' "${_raw_pages}" | jq -s 'if all(.[]; type == "array") then add else error("non-array page in timeline") end'
 }
 
 # Read current assignees as a raw JSON array.
@@ -92,7 +137,7 @@ get_issue_assignees_json() {
 
 # Provenance extraction from a pre-fetched timeline snapshot.
 # Args: assignees_json, timeline_json.
-# Output: "LOGIN TIMESTAMP" or empty. Returns nonzero on error/ambiguity.
+# Output: "LOGIN TIMESTAMP POSITION" or empty. Returns nonzero on error/ambiguity.
 find_provenance_from_timeline() {
   local assignees_json="$1"
   local timeline_json="$2"
@@ -132,7 +177,7 @@ find_provenance_from_timeline() {
             | if $has_invalidating_unlabel then
                 empty
               else
-                "\($login) \($assigned_at)"
+                "\($login) \($assigned_at) \($assigned_pos)"
               end
           else
             empty
@@ -192,7 +237,7 @@ remove_label_targeted() {
   local issue_number="$1"
   local label_name="$2"
   local encoded
-  encoded="$(printf '%s' "${label_name}" | jq -sRr '@uri' | sed 's/%0A$//;s/%0a$//')"
+  encoded="$(printf '%s' "${label_name}" | jq -sRr '@uri')"
   if retry_gh gh api --method DELETE "repos/${REPO}/issues/${issue_number}/labels/${encoded}" \
     --silent >/dev/null 2>&1; then
     return 0
@@ -224,6 +269,49 @@ remove_assignee_targeted() {
 }
 
 # Remove auto-assigned label only (no assignees to clean).
+
+restore_assignee_targeted() {
+  local issue_number="$1"
+  local login="$2"
+  retry_gh gh api --method POST "repos/${REPO}/issues/${issue_number}/assignees" \
+    -f "assignees[]=${login}" --silent >/dev/null 2>&1 || true
+
+  local verify_assignees
+  if ! verify_assignees="$(get_issue_assignees_json "${issue_number}")"; then
+    return 1
+  fi
+  echo "${verify_assignees}" | jq -e --arg login "${login}" \
+    '[.[].login] | index($login) != null' >/dev/null 2>&1
+}
+
+human_takeover_before_cleanup_unassign() {
+  local timeline_json="$1"
+  local login="$2"
+  local bot_assignment_pos="$3"
+  local snapshot_length="$4"
+
+  echo "${timeline_json}" | jq -e \
+    --arg login "${login}" \
+    --arg bot "${BOT_LOGIN}" \
+    --argjson bot_pos "${bot_assignment_pos}" \
+    --argjson snapshot_length "${snapshot_length}" '
+      to_entries as $entries
+      | ($entries | map(select(
+          .key >= $snapshot_length and
+          .value.event == "unassigned" and
+          .value.assignee.login == $login and
+          .value.actor.login == $bot
+        )) | first // null) as $cleanup_unassign
+      | $cleanup_unassign != null and
+        any($entries[];
+          .key > $bot_pos and
+          .key < $cleanup_unassign.key and
+          .value.event == "assigned" and
+          .value.assignee.login == $login and
+          (.value.actor.login // "") != $bot
+        )
+    ' >/dev/null 2>&1
+}
 remove_label_only() {
   local issue_number="$1"
   remove_label_targeted "${issue_number}" "${AUTO_ASSIGNED_LABEL}"
@@ -235,12 +323,12 @@ remove_label_only() {
 # 2 = conflicting definition; 3 = API error.
 validate_marker_label() {
   local _stderr_file raw
-  _stderr_file="$(mktemp)"
+  _stderr_file="$(mktemp "${CLEANUP_TEMP_DIR}/capture.XXXXXX")"
   raw="$(gh api "repos/${REPO}/labels/${AUTO_ASSIGNED_LABEL}" --jq '.' 2>"${_stderr_file}")" || {
     local _diag
     _diag="$(cat "${_stderr_file}" 2>/dev/null || true)"
     rm -f "${_stderr_file}"
-    if echo "${_diag}" | grep -qE 'HTTP.?404|404.*not found'; then
+    if printf '%s' "${_diag}" | grep -qE 'HTTP.?404|404.*not found'; then
       return 1
     fi
     return 3
@@ -293,11 +381,13 @@ process_issue() {
     return $?
   fi
 
-  local bot_login bot_assigned_at
+  local bot_login bot_assignment_rest bot_assigned_at bot_assigned_pos
   bot_login="${bot_assignment%% *}"
-  bot_assigned_at="${bot_assignment#* }"
+  bot_assignment_rest="${bot_assignment#* }"
+  bot_assigned_at="${bot_assignment_rest%% *}"
+  bot_assigned_pos="${bot_assignment_rest##* }"
 
-  echo "   Bot-assigned @${bot_login} at ${bot_assigned_at}"
+  echo "   Bot-assigned @${bot_login} at ${bot_assigned_at} (timeline position ${bot_assigned_pos})"
 
   if [[ "${bot_login}" == "${EXEMPT_LOGIN}" ]]; then
     echo "   Keeping @${EXEMPT_LOGIN} on #${issue_number} (exempt)"
@@ -358,15 +448,16 @@ process_issue() {
     return $?
   fi
 
-  local revalidated_login revalidated_ts
+  local revalidated_login revalidated_rest revalidated_pos
   revalidated_login="${pre_delete_assignment%% *}"
-  revalidated_ts="${pre_delete_assignment#* }"
+  revalidated_rest="${pre_delete_assignment#* }"
+  revalidated_pos="${revalidated_rest##* }"
   if [[ "${revalidated_login}" != "${bot_login}" ]]; then
     echo "   Warning: Provenance login mismatch for #${issue_number}; preserving state" >&2
     return 0
   fi
-  if [[ "${revalidated_ts}" != "${bot_assigned_at}" ]]; then
-    echo "   Warning: Provenance timestamp changed for #${issue_number}; preserving state" >&2
+  if [[ "${revalidated_pos}" != "${bot_assigned_pos}" ]]; then
+    echo "   Warning: Provenance timeline position changed for #${issue_number}; preserving state" >&2
     return 0
   fi
 
@@ -392,8 +483,29 @@ process_issue() {
 
   echo "   Unassigning stale @${bot_login} from #${issue_number}"
 
+  local pre_delete_timeline_length
+  pre_delete_timeline_length="$(echo "${pre_delete_timeline_json}" | jq 'length')" || {
+    echo "   Warning: Could not capture pre-delete timeline position for #${issue_number}" >&2
+    return 1
+  }
+
   # Remove assignee first via targeted DELETE.
   if ! remove_assignee_targeted "${issue_number}" "${bot_login}"; then
+    return 1
+  fi
+
+  local post_assignee_delete_timeline=""
+  post_assignee_delete_timeline="$(fetch_issue_timeline "${issue_number}")" || {
+    echo "   Warning: Post-assignee-DELETE timeline read failed for #${issue_number}; retaining marker" >&2
+    return 1
+  }
+
+  if human_takeover_before_cleanup_unassign "${post_assignee_delete_timeline}" "${bot_login}" "${revalidated_pos}" "${pre_delete_timeline_length}"; then
+    if restore_assignee_targeted "${issue_number}" "${bot_login}"; then
+      echo "   Warning: Human same-login takeover detected during DELETE; restored @${bot_login} and retained marker for #${issue_number}" >&2
+    else
+      echo "   Warning: Human same-login takeover detected but compensation FAILED for @${bot_login} on #${issue_number}; marker retained" >&2
+    fi
     return 1
   fi
 

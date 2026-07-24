@@ -19,11 +19,6 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { writeFileSync, rmSync } from 'fs';
-import * as nodePath from 'path';
-import { execFileSync } from 'child_process';
-import { mkdtempSync, mkdirSync, readFileSync } from 'fs';
-import { tmpdir } from 'os';
 import {
   createFakeRepo,
   defaultState,
@@ -35,9 +30,8 @@ import {
   makeUnlabeledEvent,
   daysAgo,
   failOnNth,
+  runRecordHistory,
 } from './assign-helpers.js';
-
-const ROOT = nodePath.resolve(import.meta.dirname, '../..');
 
 function defaultStateWith(overrides) {
   return { ...defaultState(), ...overrides };
@@ -495,79 +489,6 @@ describe('F4: REST-based cap count', () => {
 // ===========================================================================
 // F5: Extracted record-history script
 // ===========================================================================
-
-/**
- * Helper to run the record-assignment-history.sh script directly against
- * a fake gh, for behavioral testing of the extracted script.
- */
-function runRecordHistory({ state, assigneeLogin, extraEnv = {} }) {
-  const dir = mkdtempSync(nodePath.join(tmpdir(), 'record-hist-'));
-  const stateFile = nodePath.join(dir, 'state.json');
-  const binDir = nodePath.join(dir, 'bin');
-  mkdirSync(binDir, { recursive: true });
-  const ghWrapper = nodePath.join(binDir, 'gh');
-  const fakeGh = nodePath.join(ROOT, 'scripts/tests/fake-gh.py');
-  writeFileSync(
-    ghWrapper,
-    `#!/usr/bin/env bash\nexec python3 "${fakeGh}" "$@"\n`,
-  );
-  execFileSync('chmod', ['+x', ghWrapper]);
-
-  const defaultState = {
-    now: '2025-07-23T00:00:00Z',
-    issues: {},
-    prs: {},
-    comments: [],
-    labels: {},
-    events: {},
-    timeline: {},
-    fail_config: {},
-    ...state,
-  };
-  writeFileSync(stateFile, JSON.stringify(defaultState, null, 2));
-
-  const env = {
-    ...process.env,
-    GH_TOKEN: 'fake',
-    GITHUB_TOKEN: 'fake',
-    GITHUB_REPOSITORY: 'test/repo',
-    ASSIGNEE_LOGIN: assigneeLogin,
-    GH_FAKE_STATE: stateFile,
-    PATH: binDir + ':' + process.env.PATH,
-    ...extraEnv,
-  };
-
-  try {
-    const stdout = execFileSync(
-      'bash',
-      [nodePath.join(ROOT, '.github/scripts/record-assignment-history.sh')],
-      { encoding: 'utf8', env, stdio: ['ignore', 'pipe', 'pipe'] },
-    );
-    const finalState = JSON.parse(readFileSync(stateFile, 'utf8'));
-    return { stdout, stderr: '', status: 0, state: finalState };
-  } catch (err) {
-    // Read final state for assertions, but do NOT mask the original process
-    // error if state read/parse fails — return a structured fallback state.
-    let finalState;
-    try {
-      finalState = JSON.parse(readFileSync(stateFile, 'utf8'));
-    } catch {
-      finalState = {
-        _stateReadError: true,
-        labels: {},
-        issues: {},
-      };
-    }
-    return {
-      stdout: err.stdout?.toString() ?? '',
-      stderr: err.stderr?.toString() ?? '',
-      status: err.status ?? 1,
-      state: finalState,
-    };
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-}
 
 describe('F5: Extracted record-history script', () => {
   const HISTORY_COLOR = '0E8A16';

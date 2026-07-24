@@ -14,12 +14,25 @@
  */
 
 import { execFileSync } from 'child_process';
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync } from 'fs';
+import {
+  mkdtempSync,
+  writeFileSync,
+  readFileSync,
+  mkdirSync,
+  rmSync,
+} from 'fs';
 import { tmpdir } from 'os';
 import * as path from 'path';
 
 const ROOT = path.resolve(import.meta.dirname, '../..');
 const FAKE_GH = path.join(import.meta.dirname, 'fake-gh.py');
+
+let eventIdCounter = 200000;
+
+function nextEventId() {
+  eventIdCounter += 1;
+  return eventIdCounter;
+}
 
 /**
  * Create a temporary directory representing a fake GitHub repo.
@@ -38,11 +51,6 @@ export function createFakeRepo(initialState = {}) {
     `#!/usr/bin/env bash\nexec python3 "${FAKE_GH}" "$@"\n`,
   );
   execFileSync('chmod', ['+x', ghWrapper]);
-
-  // Write trusted contributors file in the fake repo dir (unused after remediation
-  // but harmless to have present for compatibility)
-  const trustedFile = path.join(dir, 'trusted-contributors.txt');
-  writeFileSync(trustedFile, 'acoliver\n');
 
   const defaultState = {
     now: '2025-07-23T00:00:00Z',
@@ -64,7 +72,6 @@ export function createFakeRepo(initialState = {}) {
   return {
     dir,
     stateFile,
-    trustedFile,
     binDir,
 
     readState() {
@@ -160,6 +167,81 @@ export function createFakeRepo(initialState = {}) {
 }
 
 /**
+ * Run record-assignment-history.sh against a fresh stateful fake gh.
+ * Creates its own temp directory, writes the given state, runs the script,
+ * reads the final state, and cleans up.
+ *
+ * Returns { stdout, stderr, status, state }.
+ */
+export function runRecordHistory({ state, assigneeLogin, extraEnv = {} }) {
+  const dir = mkdtempSync(path.join(tmpdir(), 'record-hist-'));
+  const stateFile = path.join(dir, 'state.json');
+  const binDir = path.join(dir, 'bin');
+  mkdirSync(binDir, { recursive: true });
+  const ghWrapper = path.join(binDir, 'gh');
+  writeFileSync(
+    ghWrapper,
+    `#!/usr/bin/env bash
+exec python3 "${FAKE_GH}" "$@"
+`,
+  );
+  execFileSync('chmod', ['+x', ghWrapper]);
+
+  const initialState = {
+    now: '2025-07-23T00:00:00Z',
+    issues: {},
+    prs: {},
+    comments: [],
+    labels: {},
+    events: {},
+    timeline: {},
+    fail_config: {},
+    ...state,
+  };
+  writeFileSync(stateFile, JSON.stringify(initialState, null, 2));
+
+  const env = {
+    ...process.env,
+    GH_TOKEN: 'fake',
+    GITHUB_TOKEN: 'fake',
+    GITHUB_REPOSITORY: 'test/repo',
+    ASSIGNEE_LOGIN: assigneeLogin,
+    GH_FAKE_STATE: stateFile,
+    PATH: binDir + ':' + process.env.PATH,
+    ...extraEnv,
+  };
+
+  try {
+    const stdout = execFileSync(
+      'bash',
+      [path.join(ROOT, '.github/scripts/record-assignment-history.sh')],
+      { encoding: 'utf8', env, stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    const finalState = JSON.parse(readFileSync(stateFile, 'utf8'));
+    return { stdout, stderr: '', status: 0, state: finalState };
+  } catch (err) {
+    let finalState;
+    try {
+      finalState = JSON.parse(readFileSync(stateFile, 'utf8'));
+    } catch {
+      finalState = {
+        issues: {},
+        labels: {},
+        comments: [],
+      };
+    }
+    return {
+      stdout: err.stdout?.toString() ?? '',
+      stderr: err.stderr?.toString() ?? '',
+      status: err.status ?? 1,
+      state: finalState,
+    };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
  * Create a default state with the auto-assigned label defined.
  */
 export function defaultState() {
@@ -242,13 +324,12 @@ export function makePR({
  * Create an "assigned" timeline event.
  */
 export function makeAssignedEvent({
-  number: _number,
   assignee,
   actor = 'github-actions[bot]',
   createdAt = '2025-07-01T00:00:00Z',
 }) {
   return {
-    id: Math.floor(Math.random() * 100000),
+    id: nextEventId(),
     event: 'assigned',
     actor: { login: actor, type: actor.endsWith('[bot]') ? 'Bot' : 'User' },
     assignee: { login: assignee },
@@ -262,14 +343,13 @@ export function makeAssignedEvent({
  * (the script must reject cross-repo PRs).
  */
 export function makeCrossRefEvent({
-  number: _number,
   prNumber,
   prAuthor,
   createdAt = '2025-07-05T00:00:00Z',
   repositoryUrl = 'https://api.github.com/repos/test/repo',
 }) {
   return {
-    id: Math.floor(Math.random() * 100000),
+    id: nextEventId(),
     event: 'cross-referenced',
     actor: { login: prAuthor, type: 'User' },
     source: {
@@ -289,13 +369,12 @@ export function makeCrossRefEvent({
  * Create a "labeled" timeline event.
  */
 export function makeLabeledEvent({
-  number: _number,
   label,
   actor = 'github-actions[bot]',
   createdAt = '2025-07-01T00:00:00Z',
 }) {
   return {
-    id: Math.floor(Math.random() * 100000),
+    id: nextEventId(),
     event: 'labeled',
     actor: { login: actor, type: actor.endsWith('[bot]') ? 'Bot' : 'User' },
     label: { name: label },
@@ -307,13 +386,12 @@ export function makeLabeledEvent({
  * Create an "unlabeled" timeline event.
  */
 export function makeUnlabeledEvent({
-  number: _number,
   label,
   actor = 'github-actions[bot]',
   createdAt = '2025-07-02T00:00:00Z',
 }) {
   return {
-    id: Math.floor(Math.random() * 100000),
+    id: nextEventId(),
     event: 'unlabeled',
     actor: { login: actor, type: actor.endsWith('[bot]') ? 'Bot' : 'User' },
     label: { name: label },
@@ -325,13 +403,12 @@ export function makeUnlabeledEvent({
  * Create an "unassigned" timeline event.
  */
 export function makeUnassignedEvent({
-  number: _number,
   assignee,
   actor = 'github-actions[bot]',
   createdAt = '2025-07-02T00:00:00Z',
 }) {
   return {
-    id: Math.floor(Math.random() * 100000),
+    id: nextEventId(),
     event: 'unassigned',
     actor: { login: actor, type: actor.endsWith('[bot]') ? 'Bot' : 'User' },
     assignee: { login: assignee },
@@ -342,12 +419,9 @@ export function makeUnassignedEvent({
 /**
  * Create a "closed" timeline event (indicating a linked PR was merged/closed).
  */
-export function makeClosedEvent({
-  number: _number,
-  createdAt = '2025-07-10T00:00:00Z',
-}) {
+export function makeClosedEvent({ createdAt = '2025-07-10T00:00:00Z' }) {
   return {
-    id: Math.floor(Math.random() * 100000),
+    id: nextEventId(),
     event: 'closed',
     actor: { login: 'someone', type: 'User' },
     created_at: createdAt,

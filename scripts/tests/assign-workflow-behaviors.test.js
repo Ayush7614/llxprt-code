@@ -39,6 +39,12 @@ import {
 describe('assign.yml workflow configuration', () => {
   const source = readRootFile('.github/workflows/assign.yml');
   const workflow = yaml.load(source);
+
+  it('workflow has jobs defined', () => {
+    expect(workflow.jobs, 'workflow should have jobs').toBeDefined();
+    expect(workflow.jobs.assign, 'assign job should exist').toBeDefined();
+  });
+
   const job = workflow.jobs?.assign;
 
   it('triggers on issue_comment created and issues assigned', () => {
@@ -57,7 +63,7 @@ describe('assign.yml workflow configuration', () => {
 
   it('gates on exact /assign for issues (not PRs) and rejects bots', () => {
     expect(job, 'assign job should exist').toBeTruthy();
-    const condition = normalize(job.if);
+    const condition = normalize(job?.if ?? '');
     expect(condition).toContain('github.event.issue.pull_request == null');
     expect(condition).toContain("github.event.comment.user.type != 'Bot'");
     expect(condition).toContain("github.event.comment.body == '/assign'");
@@ -70,14 +76,18 @@ describe('assign.yml workflow configuration', () => {
     );
   });
 
-  it('assign job has NO concurrency block (postconditions handle races)', () => {
-    expect(job.concurrency).toBeUndefined();
+  it('serializes attempts per stable actor ID without cancelling in progress', () => {
+    expect(job?.concurrency).toEqual({
+      group: 'assign-${{ github.event.comment.user.id }}',
+      'cancel-in-progress': false,
+    });
   });
 
   it('passes env vars and runs the script', () => {
-    const runStep = job.steps?.find(
+    const runStep = job?.steps?.find(
       (s) => s.name === 'Run assign-issue script',
     );
+    expect(runStep, 'Run assign-issue script step should exist').toBeTruthy();
     expect(runStep?.run).toContain('./.github/scripts/assign-issue.sh');
     expect(runStep?.env?.ISSUE_NUMBER).toBe('${{ github.event.issue.number }}');
     expect(runStep?.env?.COMMENTER_LOGIN).toBe(
@@ -89,29 +99,44 @@ describe('assign.yml workflow configuration', () => {
 
 describe('assign.yml record-history job', () => {
   const workflow = yaml.load(readRootFile('.github/workflows/assign.yml'));
+
+  it('workflow has a record-history job', () => {
+    expect(workflow.jobs, 'workflow should have jobs').toBeDefined();
+    expect(
+      workflow.jobs['record-history'],
+      'record-history job should exist',
+    ).toBeDefined();
+  });
+
   const job = workflow.jobs?.['record-history'];
 
   it('has a record-history job that fires on issues:assigned events', () => {
     expect(job, 'record-history job should exist').toBeTruthy();
-    expect(normalize(job.if)).toContain("github.event_name == 'issues'");
-    expect(normalize(job.if)).toContain("github.event.action == 'assigned'");
+    expect(normalize(job?.if ?? '')).toContain("github.event_name == 'issues'");
+    expect(normalize(job?.if ?? '')).toContain(
+      "github.event.action == 'assigned'",
+    );
   });
 
   it('uses least-privilege permissions', () => {
-    expect(job.permissions).toEqual({
+    expect(job?.permissions).toEqual({
       contents: 'read',
       issues: 'write',
     });
   });
 
   it('validates login from event payload and delegates to record-history script', () => {
-    const runStep = job.steps?.find(
+    const runStep = job?.steps?.find(
       (s) => s.name === 'Record assignment-history label',
     );
+    expect(
+      runStep,
+      'Record assignment-history label step should exist',
+    ).toBeTruthy();
     expect(runStep?.env?.ASSIGNEE_LOGIN).toBe(
       '${{ github.event.assignee.login }}',
     );
-    const runText = normalize(runStep?.run);
+    const runText = normalize(runStep?.run ?? '');
     // Must invoke the extracted record-history script
     expect(runText).toContain('record-assignment-history.sh');
     // Must NOT contain inline label creation logic (delegated to script)
@@ -122,6 +147,12 @@ describe('assign.yml record-history job', () => {
 describe('assign-stale-cleanup.yml workflow configuration', () => {
   const source = readRootFile('.github/workflows/assign-stale-cleanup.yml');
   const workflow = yaml.load(source);
+
+  it('workflow has a cleanup job', () => {
+    expect(workflow.jobs, 'workflow should have jobs').toBeDefined();
+    expect(workflow.jobs.cleanup, 'cleanup job should exist').toBeDefined();
+  });
+
   const job = workflow.jobs?.cleanup;
 
   it('runs on a daily schedule and workflow_dispatch', () => {
@@ -130,10 +161,10 @@ describe('assign-stale-cleanup.yml workflow configuration', () => {
   });
 
   it('guards scheduled runs to the canonical upstream repository', () => {
-    expect(normalize(job?.if)).toContain(
+    expect(normalize(job?.if ?? '')).toContain(
       "github.repository == 'vybestack/llxprt-code'",
     );
-    expect(normalize(job?.if)).not.toContain('llpxrt-code');
+    expect(normalize(job?.if ?? '')).not.toContain('llpxrt-code');
   });
 });
 
@@ -728,7 +759,7 @@ describe('CONTRIBUTING.md self-assign docs', () => {
       'Self Assigning Issues section should exist',
     ).toBeTruthy();
     const sectionText = normalize(selfAssignSection[0]);
-    expect(sectionText).not.toMatch(/owner|member|collaborator/i);
+    expect(sectionText).not.toMatch(/\bowner\b|\bmember\b|\bcollaborator\b/i);
     // Must not claim write access is the only cause of assignment failure
     expect(sectionText).not.toContain('write access is the only');
   });

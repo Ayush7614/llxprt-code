@@ -424,10 +424,10 @@ describe('B: Targeted REST mutations', () => {
 
   it('jq @uri encodes special-character label names for DELETE', () => {
     // The cleanup script uses `jq -sRr '@uri'` to URL-encode label names.
-    // This verifies that special characters (comma, space, slash) are properly
-    // encoded so the DELETE endpoint receives the correct path. The raw+slurp
-    // mode produces a single string (not an array), which is the correct
-    // behavior for @uri.
+    // This verifies that space and slash in label names are properly encoded
+    // so the DELETE endpoint receives the correct path. The raw+slurp mode
+    // produces a single string (not an array), which is the correct behavior
+    // for @uri. The label under test is 'priority: high/urgent' (space + slash).
     const assignedAt = daysAgo(20);
     const repo = createFakeRepo(
       defaultStateWith({
@@ -850,7 +850,7 @@ describe('E: PR filtering', () => {
 // ===========================================================================
 
 describe('F: Per-issue concurrency and post-cap rollback', () => {
-  it('assign job has NO concurrency block (postconditions handle races)', async () => {
+  it('serializes attempts per stable actor ID without cancelling in progress', async () => {
     const yaml = (await import('js-yaml')).default;
     const fs = await import('fs');
     const source = fs.readFileSync(
@@ -864,7 +864,10 @@ describe('F: Per-issue concurrency and post-cap rollback', () => {
     const workflow = yaml.load(source);
     expect(workflow.jobs, 'workflow should have jobs').toBeDefined();
     expect(workflow.jobs.assign, 'assign job should exist').toBeDefined();
-    expect(workflow.jobs.assign.concurrency).toBeUndefined();
+    expect(workflow.jobs.assign.concurrency).toEqual({
+      group: 'assign-${{ github.event.comment.user.id }}',
+      'cancel-in-progress': false,
+    });
   });
 
   it('race: concurrent assignment pushes over cap, rollback occurs', () => {
