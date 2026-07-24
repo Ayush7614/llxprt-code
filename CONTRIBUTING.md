@@ -41,12 +41,12 @@ for this purpose.
 To assign an issue to yourself, add a comment that contains **only** the text `/assign` (nothing else). A GitHub Action handles the request when:
 
 1. The issue is not already assigned.
-2. You are eligible: you have at least one **merged PR** in this repository, **or** you have previously been assigned an issue here, **or** you are listed in [`.github/trusted-contributors.txt`](.github/trusted-contributors.txt), **or** you are a repository owner/member/collaborator.
-3. You currently have fewer than **3** open issues assigned to you (hard concurrency cap to limit spam / hoarding).
+2. You are eligible: you have at least one **merged PR** in this repository, **or** you have a durable prior assignment (previously assigned to an issue here — current or past assignments in open or closed issues both qualify, recorded in a history index).
+3. You currently have fewer than **3** open issues assigned to you (hard cap to limit spam / hoarding).
 
-Bot accounts are ignored. On success the issue is labeled `auto-assigned`. If GitHub cannot assign you (for example, you do not have write access), the action posts feedback explaining the outcome so a maintainer can help.
+Bot accounts are ignored. On success the issue is labeled `auto-assigned` and a feedback comment is posted. Assignment may fail for several reasons (the issue was assigned by a concurrent request, the eligibility check could not be verified, GitHub API errors, or the assignee lacks write access to the repository). The automation attempts to post feedback in failure cases.
 
-Auto-assignments with **no linked PR activity for 2 weeks** may be unassigned automatically (maintainer `acoliver` is exempt as an assignee; other co-assignees can still be cleaned up). Comment `/assign` again if you still intend to work on the issue.
+Auto-assignments older than **2 weeks** with no qualifying linked PR activity are unassigned automatically. Only the login assigned by the `/assign` automation is removed — manual co-assignees are preserved. The maintainer `acoliver` is exempt from cleanup. Comment `/assign` again if you still intend to work on the issue.
 
 ### Pull Request Guidelines
 

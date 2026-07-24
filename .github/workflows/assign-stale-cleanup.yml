@@ -2,6 +2,9 @@ name: Assign Stale Cleanup
 
 # Unassigns issues that were auto-assigned via /assign but have had no linked
 # PR activity for two weeks. Never unassigns acoliver.
+#
+# Uses targeted DELETE endpoints (never whole-array PATCH) to preserve
+# concurrent human state and comma-bearing label names.
 
 on:
   schedule:

@@ -2,17 +2,27 @@ name: Assign Issue
 
 # Implements the CONTRIBUTING.md `/assign` self-assignment convention.
 # Comment body must be exactly `/assign` (optional trailing LF/CRLF/tab only).
+#
+# Also records issue assignment events in a durable label index so that
+# /assign historical eligibility can use O(1) label lookups instead of
+# scanning repository events. The assign job itself creates the history
+# label directly (GitHub suppresses recursive issues:assigned workflows
+# triggered by GITHUB_TOKEN, so the record-history job may not fire for
+# automated assignments).
 
 on:
   issue_comment:
     types:
       - created
+  issues:
+    types:
+      - assigned
 
 permissions:
   contents: read
   issues: write
-  # Required for `gh search prs --merged` eligibility checks under an explicit
-  # permissions block (public repos are not exempt once permissions: is set).
+  # Required for merged-PR eligibility checks under an explicit permissions
+  # block (public repos are not exempt once permissions: is set).
   pull-requests: read
 
 defaults:
@@ -30,17 +40,20 @@ jobs:
     # Exact `/assign` only (CONTRIBUTING.md). Support LF, CRLF, and trailing tab
     # via toJSON equality (not startsWith) so `/assign foo` never matches.
     # Ignore PR review comments and Bot accounts (spam hardening).
+    #
+    # No workflow concurrency: concurrent same-issue runs converge via
+    # postconditions enforced by assign-issue.sh (exactly-one-assignee
+    # verification, contention rollback, post-cap rollback). This ensures
+    # no valid comments are silently dropped.
     if: |
+      github.event_name == 'issue_comment' &&
       github.event.issue.pull_request == null &&
+      github.event.issue.state == 'open' &&
       github.event.comment.user.type != 'Bot' &&
       (github.event.comment.body == '/assign' ||
        toJSON(github.event.comment.body) == '"/assign\n"' ||
        toJSON(github.event.comment.body) == '"/assign\r\n"' ||
        toJSON(github.event.comment.body) == '"/assign\t"')
-    # Per-issue cancel + per-actor serialize to blunt /assign floods.
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.event.issue.number }}-${{ github.event.comment.user.login }}
-      cancel-in-progress: true
     steps:
       - name: Checkout repository
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # ratchet:actions/checkout@v5
@@ -55,8 +68,39 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           COMMENTER_LOGIN: ${{ github.event.comment.user.login }}
-          AUTHOR_ASSOCIATION: ${{ github.event.comment.author_association }}
         run: |
           set -euo pipefail
           chmod +x ./.github/scripts/assign-issue.sh
           ./.github/scripts/assign-issue.sh
+
+  record-history:
+    name: Record assignment history
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Fires on issue assignment events for human/manual assignments.
+    # Automated /assign assignments also create the history label directly
+    # in assign-issue.sh because GitHub suppresses recursive
+    # issues:assigned workflows caused by GITHUB_TOKEN.
+    if: |
+      github.event_name == 'issues' &&
+      github.event.action == 'assigned'
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # ratchet:actions/checkout@v5
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Record assignment-history label
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          ASSIGNEE_LOGIN: ${{ github.event.assignee.login }}
+        run: |
+          set -euo pipefail
+          chmod +x ./.github/scripts/record-assignment-history.sh
+          ./.github/scripts/record-assignment-history.sh

@@ -4,6 +4,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+/**
+ * Structural/config tests for the /assign automation.
+ *
+ * Behavioral tests (executing the real scripts against a fake gh) live in
+ * assign-workflow-behaviors.test.js. This file validates workflow YAML
+ * structure, script presence, and documentation consistency.
+ */
+
 import { describe, expect, it } from 'vitest';
 import yaml from 'js-yaml';
 import * as fs from 'fs';
@@ -25,8 +33,9 @@ describe('.github/workflows/assign.yml', () => {
   const { source, workflow } = loadWorkflow('.github/workflows/assign.yml');
   const job = workflow.jobs?.assign;
 
-  it('triggers on issue_comment created only', () => {
+  it('triggers on issue_comment created and issues assigned', () => {
     expect(workflow.on?.issue_comment?.types).toEqual(['created']);
+    expect(workflow.on?.issues?.types).toEqual(['assigned']);
     expect(workflow.on?.pull_request).toBeUndefined();
   });
 
@@ -50,20 +59,16 @@ describe('.github/workflows/assign.yml', () => {
     expect(condition).toContain(
       `toJSON(github.event.comment.body) == '"/assign\\r\\n"'`,
     );
-    // Must not use startsWith, which would accept `/assign foo`.
     expect(source).not.toMatch(
       /startsWith\(toJSON\(github\.event\.comment\.body\)/,
     );
   });
 
-  it('scopes concurrency by workflow, issue, and actor', () => {
-    expect(job.concurrency?.['cancel-in-progress']).toBe(true);
-    expect(normalize(job.concurrency?.group)).toBe(
-      '${{ github.workflow }}-${{ github.event.issue.number }}-${{ github.event.comment.user.login }}',
-    );
+  it('assign job has NO concurrency block (postconditions handle races)', () => {
+    expect(job.concurrency).toBeUndefined();
   });
 
-  it('checks out with the ratchet-pinned checkout action and runs assign-issue.sh', () => {
+  it('passes env vars and runs the script', () => {
     const checkout = job.steps?.find((s) => s.name === 'Checkout repository');
     expect(checkout?.uses).toBe(
       'actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8',
@@ -99,7 +104,6 @@ describe('.github/workflows/assign-stale-cleanup.yml', () => {
     expect(normalize(job?.if)).toContain(
       "github.repository == 'vybestack/llxprt-code'",
     );
-    // Do not copy the historical typo from llxprt-scheduled-pr-triage.yml.
     expect(normalize(job?.if)).not.toContain('llpxrt-code');
   });
 
@@ -119,7 +123,7 @@ describe('.github/workflows/assign-stale-cleanup.yml', () => {
 });
 
 describe('.github/scripts assign automation', () => {
-  it('assign-issue.sh enforces eligibility, cap, label, and sticky feedback', () => {
+  it('assign-issue.sh uses gh api exclusively with fail-closed guards', () => {
     const script = fs.readFileSync(
       path.join(ROOT, '.github/scripts/assign-issue.sh'),
       'utf8',
@@ -127,14 +131,12 @@ describe('.github/scripts assign automation', () => {
     expect(script).toContain("MARKER='<!-- llxprt-assign-feedback -->'");
     expect(script).toContain("AUTO_ASSIGNED_LABEL='auto-assigned'");
     expect(script).toContain('MAX_ASSIGNMENTS=3');
-    expect(script).toContain('trusted-contributors.txt');
-    expect(script).toContain('gh search prs');
-    expect(script).toContain('--merged');
-    expect(script).toContain('--add-assignee');
-    expect(script).toContain('post_sticky_feedback');
+    expect(script).toContain('gh api');
+    expect(script).toContain('merged');
+    expect(script).toContain('github-actions[bot]');
   });
 
-  it('unassign-stale-issues.sh uses a 14-day window and exempts acoliver', () => {
+  it('unassign-stale-issues.sh contains required structural markers (constants, provenance, exemption)', () => {
     const script = fs.readFileSync(
       path.join(ROOT, '.github/scripts/unassign-stale-issues.sh'),
       'utf8',
@@ -143,7 +145,8 @@ describe('.github/scripts assign automation', () => {
     expect(script).toContain("EXEMPT_LOGIN='acoliver'");
     expect(script).toContain("AUTO_ASSIGNED_LABEL='auto-assigned'");
     expect(script).toContain('retry_gh');
-    expect(script).toContain('--remove-assignee');
+    expect(script).toContain('github-actions[bot]');
+    expect(script).toContain('timeline');
   });
 });
 
@@ -152,7 +155,6 @@ describe('CONTRIBUTING.md self-assign docs', () => {
     const docs = readRootFile('CONTRIBUTING.md');
     expect(docs).toContain('/assign');
     expect(docs).toContain('merged PR');
-    expect(docs).toContain('trusted-contributors.txt');
     expect(docs).toContain('3');
     expect(docs).toContain('auto-assigned');
     expect(docs).toContain('2 weeks');
