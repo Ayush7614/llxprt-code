@@ -348,15 +348,16 @@ describe('4: Final cap read fail-closed', () => {
 });
 
 // ===========================================================================
-// 5: Per-actor concurrency serialization
+// 5: Actor+issue concurrency grouping
 // ===========================================================================
 
 describe('5: Per-actor concurrency serialization', () => {
-  it('uses the stable commenter ID without issue number and does not cancel', () => {
+  it('groups concurrency by commenter ID AND issue number to allow independent distinct issues', () => {
     const source = readRootFile('.github/workflows/assign.yml');
     const workflow = yaml.load(source);
     expect(workflow.jobs.assign.concurrency).toEqual({
-      group: 'assign-${{ github.event.comment.user.id }}',
+      group:
+        'assign-${{ github.event.comment.user.id }}-${{ github.event.issue.number }}',
       'cancel-in-progress': false,
     });
   });

@@ -31,6 +31,14 @@ jobs:
     timeout-minutes: 15
     # Restrict scheduled runs to the canonical upstream repository.
     if: ${{ github.repository == 'vybestack/llxprt-code' }}
+    # Coordinated concurrency so overlapping scheduled runs or manual
+    # dispatches serialize cleanly. cancel-in-progress is false so an
+    # in-flight cleanup completes its full reconciliation rather than
+    # being cancelled mid-mutation. The group is stable and repository-
+    # scoped (not run-specific).
+    concurrency:
+      group: stale-cleanup-${{ github.repository }}
+      cancel-in-progress: false
     steps:
       - name: Checkout repository
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # ratchet:actions/checkout@v5

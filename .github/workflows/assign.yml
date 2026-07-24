@@ -41,11 +41,14 @@ jobs:
     # via toJSON equality (not startsWith) so `/assign foo` never matches.
     # Ignore PR review comments and Bot accounts (spam hardening).
     #
-    # Serialize each actor's attempts across issues to bound fan-out while
-    # preserving independent progress for different actors. In-flight attempts
+    # Group concurrency by commenter user ID AND issue number so that
+    # /assign commands on distinct issues from the same actor run
+    # independently (GitHub retains only one pending job per group). The
+    # real-script post-mutation cap enforcement/election remains
+    # authoritative for bounding total assignments. In-flight attempts
     # complete rather than being cancelled with partial mutations.
     concurrency:
-      group: assign-${{ github.event.comment.user.id }}
+      group: assign-${{ github.event.comment.user.id }}-${{ github.event.issue.number }}
       cancel-in-progress: false
     if: |
       github.event_name == 'issue_comment' &&
@@ -84,6 +87,14 @@ jobs:
     # history. GITHUB_TOKEN recursion is already suppressed by GitHub, so
     # automated /assign assignments are also recorded directly in
     # assign-issue.sh (this job may not fire for those).
+    #
+    # Serialize per assignee so rapid reassignments of the same user do not
+    # race on label creation. In-flight runs complete rather than being
+    # cancelled (avoid partial label state). The assign job preserves its own
+    # per-actor concurrency independently.
+    concurrency:
+      group: record-history-${{ github.event.assignee.id }}
+      cancel-in-progress: false
     if: |
       github.event_name == 'issues' &&
       github.event.action == 'assigned'

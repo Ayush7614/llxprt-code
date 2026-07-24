@@ -34,12 +34,26 @@ function nextEventId() {
   return eventIdCounter;
 }
 
+// Track temp directories created by createFakeRepo so they can be cleaned up
+// when the Vitest worker process exits, preventing resource leaks across tests.
+const _fakeRepoDirs = [];
+process.on('beforeExit', () => {
+  for (const d of _fakeRepoDirs) {
+    try {
+      rmSync(d, { recursive: true, force: true });
+    } catch {
+      // already removed
+    }
+  }
+});
+
 /**
  * Create a temporary directory representing a fake GitHub repo.
  * Returns an object with methods to manage state and run scripts.
  */
 export function createFakeRepo(initialState = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), 'assign-test-'));
+  _fakeRepoDirs.push(dir);
   const stateFile = path.join(dir, 'state.json');
 
   // Create a bin dir with a `gh` wrapper that delegates to fake-gh.py
@@ -67,7 +81,7 @@ export function createFakeRepo(initialState = {}) {
 
   writeFileSync(stateFile, JSON.stringify(defaultState, null, 2));
 
-  const pathWithFakeGh = binDir + ':' + process.env.PATH;
+  const pathWithFakeGh = binDir + path.delimiter + process.env.PATH;
 
   return {
     dir,
@@ -207,7 +221,7 @@ exec python3 "${FAKE_GH}" "$@"
     GITHUB_REPOSITORY: 'test/repo',
     ASSIGNEE_LOGIN: assigneeLogin,
     GH_FAKE_STATE: stateFile,
-    PATH: binDir + ':' + process.env.PATH,
+    PATH: binDir + path.delimiter + process.env.PATH,
     ...extraEnv,
   };
 

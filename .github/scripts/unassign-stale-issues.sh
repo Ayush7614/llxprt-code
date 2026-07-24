@@ -222,11 +222,25 @@ has_qualifying_linked_pr_from_timeline() {
 
 # Discover candidates: open issues with auto-assigned label.
 # GitHub /issues includes PRs; filter to issues only.
+# Captures gh stderr so a sanitized first line can be printed on failure
+# (pipefail already ensures no partial results leak through).
 discover_candidates() {
-  gh api "repos/${REPO}/issues?state=open&labels=${AUTO_ASSIGNED_LABEL}&per_page=100" \
-    --paginate 2>/dev/null \
+  local _stderr_file _raw
+  _stderr_file="$(mktemp "${CLEANUP_TEMP_DIR}/discover.XXXXXX")"
+  _raw="$(gh api "repos/${REPO}/issues?state=open&labels=${AUTO_ASSIGNED_LABEL}&per_page=100" \
+    --paginate 2>"${_stderr_file}" \
     | jq -sr 'if all(.[]; type == "array") then add else error("non-array page") end
-             | .[]? | select(.pull_request == null) | "\(.number)\t\(.assignees)"'
+             | .[]? | select(.pull_request == null) | "\(.number)\t\(.assignees)"')"
+  local _rc=$?
+  if [[ "${_rc}" -ne 0 ]]; then
+    local _diag
+    _diag="$(head -1 "${_stderr_file}" 2>/dev/null | tr -d '\000-\037' || true)"
+    rm -f "${_stderr_file}"
+    printf '‼ Candidate discovery failed: %s\n' "${_diag}" >&2
+    return 1
+  fi
+  rm -f "${_stderr_file}"
+  printf '%s' "${_raw}"
 }
 
 # Remove only the auto-assigned label via targeted DELETE. Uses jq @uri.
@@ -284,6 +298,21 @@ restore_assignee_targeted() {
     '[.[].login] | index($login) != null' >/dev/null 2>&1
 }
 
+# Restore the auto-assigned marker label via targeted POST. Verifies presence
+# after POST. Returns 0 if present, 1 otherwise.
+restore_label_targeted() {
+  local issue_number="$1"
+  retry_gh gh api --method POST "repos/${REPO}/issues/${issue_number}/labels" \
+    -f "labels[]=${AUTO_ASSIGNED_LABEL}" --silent >/dev/null 2>&1 || true
+
+  local verify_labels
+  if ! verify_labels="$(gh api "repos/${REPO}/issues/${issue_number}" --jq '.labels // []' 2>/dev/null)"; then
+    return 1
+  fi
+  echo "${verify_labels}" | jq -e --arg lbl "${AUTO_ASSIGNED_LABEL}" \
+    '[.[].name] | index($lbl) != null' >/dev/null 2>&1
+}
+
 human_takeover_before_cleanup_unassign() {
   local timeline_json="$1"
   local login="$2"
@@ -312,6 +341,59 @@ human_takeover_before_cleanup_unassign() {
         )
     ' >/dev/null 2>&1
 }
+
+# Detect any fresh "assigned" transition at or after the pre-delete snapshot
+# position. A concurrent /assign (by bot OR human, any login) between our
+# pre-delete validation and the stale DELETE creates such an event.
+# Uses an ordered per-login transition model: returns true only if at least
+# one login's LATEST transition at or after the snapshot is "assigned".
+# A login that was assigned then independently unassigned does NOT count.
+# Returns 0 (true) if a live fresh assignment exists, 1 (false) otherwise.
+fresh_assignment_after_snapshot() {
+  local timeline_json="$1"
+  local snapshot_length="$2"
+
+  echo "${timeline_json}" | jq -e \
+    --argjson snapshot_length "${snapshot_length}" '
+      if type != "array" then error("timeline is not an array") else . end
+      | to_entries
+      | map(select(
+          .key >= $snapshot_length
+          and (.value.event == "assigned" or .value.event == "unassigned")
+        ))
+      | group_by(.value.assignee.login)
+      | map(select(length > 0))
+      | any((last | .value.event) == "assigned")
+    ' >/dev/null 2>&1
+}
+
+# Extract logins whose LATEST transition at or after the snapshot position
+# is "assigned". Uses an ordered per-login transition model: for each login,
+# examines all assigned/unassigned events at or after the snapshot, and only
+# includes the login if its last transition is "assigned". A login that was
+# assigned then independently unassigned after the snapshot is NOT restored.
+# Output: one login per line.
+fresh_assignment_logins_after_snapshot() {
+  local timeline_json="$1"
+  local snapshot_length="$2"
+
+  echo "${timeline_json}" | jq -r \
+    --argjson snapshot_length "${snapshot_length}" '
+      if type != "array" then error("timeline is not an array") else . end
+      | to_entries
+      | map(select(
+          .key >= $snapshot_length
+          and (.value.event == "assigned" or .value.event == "unassigned")
+        ))
+      | sort_by(.value.assignee.login)
+      | group_by(.value.assignee.login)
+      | map(select(length > 0))
+      | map(select((last | .value.event) == "assigned"))
+      | map(first | .value.assignee.login)
+      | .[]
+    ' 2>/dev/null
+}
+
 remove_label_only() {
   local issue_number="$1"
   remove_label_targeted "${issue_number}" "${AUTO_ASSIGNED_LABEL}"
@@ -522,11 +604,103 @@ process_issue() {
     return 1
   fi
 
+  # Defensive reconciliation: check if any fresh assignment transition
+  # (by bot OR human, any login) appeared at or after the pre-delete
+  # snapshot position. A concurrent /assign between stale validation and
+  # the stale DELETE creates such an event. If detected, we must preserve
+  # the fresh assignment(s) and retain the auto-assigned marker.
+  #
+  # Same-login: the stale DELETE may have removed the fresh bot assignment.
+  # Restore it via targeted POST and verify.
+  # Different-login: the fresh assignee is untouched by the stale DELETE
+  # (targeted endpoint removes only bot_login). Just retain the marker.
+  if fresh_assignment_after_snapshot "${post_assignee_delete_timeline}" "${pre_delete_timeline_length}"; then
+    local _fresh_logins
+    _fresh_logins="$(fresh_assignment_logins_after_snapshot "${post_assignee_delete_timeline}" "${pre_delete_timeline_length}")" || true
+
+    local _restored_any=0
+    while IFS= read -r _fresh_login; do
+      [[ -z "${_fresh_login}" ]] && continue
+      # Check if this fresh login is currently assigned (it may have been
+      # deleted by the stale DELETE if it's the same login as bot_login).
+      if echo "${mid_delete_assignees_json}" | jq -e --arg login "${_fresh_login}" '[.[].login] | index($login) != null' >/dev/null 2>&1; then
+        # Already assigned — fresh assignment survives. Nothing to do.
+        :
+      else
+        # Same-login fresh assignment was deleted by the stale DELETE.
+        # Restore via targeted POST and verify.
+        if restore_assignee_targeted "${issue_number}" "${_fresh_login}"; then
+          echo "   Warning: Fresh assignment @${_fresh_login} was deleted by stale DELETE; restored and retaining marker for #${issue_number}" >&2
+          _restored_any=1
+        else
+          echo "   Warning: Fresh assignment @${_fresh_login} restoration FAILED for #${issue_number}; marker retained" >&2
+        fi
+      fi
+    done <<<"${_fresh_logins}"
+
+    echo "   Warning: Fresh assignment detected after stale DELETE; retaining marker for #${issue_number}" >&2
+    return 1
+  fi
+
+  # Pre-marker-delete reconciliation: re-read assignees + fresh timeline
+  # immediately before label DELETE to detect races that landed between the
+  # mid-assignee read and now. If a fresh assignment stint appeared, we must
+  # preserve/restore it and retain the marker — fail this issue safely.
+  local pre_label_assignees_json=""
+  pre_label_assignees_json="$(get_issue_assignees_json "${issue_number}")" || {
+    echo "   Warning: Pre-label-DELETE assignee read failed for #${issue_number}; retaining marker" >&2
+    return 1
+  }
+
+  local pre_label_timeline_json=""
+  pre_label_timeline_json="$(fetch_issue_timeline "${issue_number}")" || {
+    echo "   Warning: Pre-label-DELETE timeline read failed for #${issue_number}; retaining marker" >&2
+    return 1
+  }
+
+  local pre_label_timeline_length
+  pre_label_timeline_length="$(echo "${pre_label_timeline_json}" | jq 'length')" || {
+    echo "   Warning: Could not capture pre-label-DELETE timeline length for #${issue_number}" >&2
+    return 1
+  }
+
+  if fresh_assignment_after_snapshot "${pre_label_timeline_json}" "${pre_delete_timeline_length}"; then
+    local _pre_label_fresh_logins
+    _pre_label_fresh_logins="$(fresh_assignment_logins_after_snapshot "${pre_label_timeline_json}" "${pre_delete_timeline_length}")" || true
+    while IFS= read -r _fresh_login; do
+      [[ -z "${_fresh_login}" ]] && continue
+      if ! echo "${pre_label_assignees_json}" | jq -e --arg login "${_fresh_login}" '[.[].login] | index($login) != null' >/dev/null 2>&1; then
+        restore_assignee_targeted "${issue_number}" "${_fresh_login}" || true
+      fi
+    done <<<"${_pre_label_fresh_logins}"
+    echo "   Warning: Fresh assignment detected before label DELETE; retaining marker for #${issue_number}" >&2
+    return 1
+  fi
+
   # Remove auto-assigned label via targeted DELETE.
   if ! remove_label_targeted "${issue_number}" "${AUTO_ASSIGNED_LABEL}"; then
-    # Assignee was already removed but label DELETE failed. Report honestly
-    # that assignment was removed and leave the marker for a later retry.
     echo "   Assignment removed for #${issue_number}, but label remains for retry" >&2
+    return 1
+  fi
+
+  # Post-marker-delete compensation: re-read fresh timeline immediately
+  # after label DELETE. A fresh assignment that landed during or immediately
+  # after label DELETE must be compensated: restore the marker label so the
+  # fresh assignment is tracked.
+  local post_label_timeline_json=""
+  post_label_timeline_json="$(fetch_issue_timeline "${issue_number}")" || {
+    echo "   Warning: Post-label-DELETE timeline read failed for #${issue_number}; retaining marker" >&2
+    return 1
+  }
+
+  if fresh_assignment_after_snapshot "${post_label_timeline_json}" "${pre_label_timeline_length}"; then
+    # A fresh assignment appeared between pre-label-DELETE snapshot and now.
+    # Restore the marker so the fresh assignment is tracked.
+    if restore_label_targeted "${issue_number}"; then
+      echo "   Warning: Fresh assignment detected after label DELETE; restored marker for #${issue_number}" >&2
+    else
+      echo "   Warning: Fresh assignment detected after label DELETE but marker restore FAILED for #${issue_number}" >&2
+    fi
     return 1
   fi
 

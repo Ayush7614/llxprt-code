@@ -208,16 +208,122 @@ describe('F2: record-history hardening', () => {
   });
 
   it('uses printf not echo for diagnostics (no interpretation of format)', () => {
-    // A login with %s should not cause printf to consume it as a format spec
-    // in error messages. The validation happens before label construction,
-    // but the printf in diagnostics must not interpret % in the login.
+    // A login containing a percent character should not cause printf to
+    // consume it as a format spec in error messages. The validation happens
+    // before label construction, but the printf in diagnostics must not
+    // interpret % in the login.
     const result = runRecordHistory({
       state: { labels: {} },
       assigneeLogin: 'evil%shere',
     });
 
-    // The login has a space so it's invalid
+    // A percent character is not an allowed GitHub login character.
     expect(result.status).not.toBe(0);
+  });
+
+  it('rejects empty login with clear error', () => {
+    const result = runRecordHistory({
+      state: { labels: {} },
+      assigneeLogin: '',
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.state.labels['asnhist--']).toBeUndefined();
+  });
+
+  it('rejects login with invalid characters', () => {
+    const result = runRecordHistory({
+      state: { labels: {} },
+      assigneeLogin: 'invalid user!',
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.state.labels['asnhist--invalid user!']).toBeUndefined();
+  });
+
+  it('accepts a normal valid login', () => {
+    const result = runRecordHistory({
+      state: { labels: {} },
+      assigneeLogin: 'valid-user',
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.state.labels['asnhist--valid-user']).toBeDefined();
+  });
+
+  // Boundary behavior per real GitHub username rules:
+  // 1-39 chars, alphanumeric segments separated by single hyphens; no
+  // leading/trailing/consecutive hyphens, no non-alphanumeric chars.
+  it('accepts a 1-character login (minimum boundary)', () => {
+    const result = runRecordHistory({
+      state: { labels: {} },
+      assigneeLogin: 'a',
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.state.labels['asnhist--a']).toBeDefined();
+  });
+
+  it('accepts a 39-character login (maximum boundary)', () => {
+    const login = 'a'.repeat(39);
+    const result = runRecordHistory({
+      state: { labels: {} },
+      assigneeLogin: login,
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.state.labels[`asnhist--${login}`]).toBeDefined();
+  });
+
+  it('rejects a 40-character login (over maximum)', () => {
+    const login = 'a'.repeat(40);
+    const result = runRecordHistory({
+      state: { labels: {} },
+      assigneeLogin: login,
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.state.labels[`asnhist--${login}`]).toBeUndefined();
+  });
+
+  it('rejects a leading hyphen', () => {
+    const result = runRecordHistory({
+      state: { labels: {} },
+      assigneeLogin: '-alice',
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.state.labels['asnhist---alice']).toBeUndefined();
+  });
+
+  it('rejects a trailing hyphen', () => {
+    const result = runRecordHistory({
+      state: { labels: {} },
+      assigneeLogin: 'alice-',
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.state.labels['asnhist--alice-']).toBeUndefined();
+  });
+
+  it('rejects consecutive hyphens', () => {
+    const result = runRecordHistory({
+      state: { labels: {} },
+      assigneeLogin: 'alice--bob',
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.state.labels['asnhist--alice--bob']).toBeUndefined();
+  });
+
+  it('accepts a valid hyphenated login (single hyphens between segments)', () => {
+    const result = runRecordHistory({
+      state: { labels: {} },
+      assigneeLogin: 'alice-bob-charlie',
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.state.labels['asnhist--alice-bob-charlie']).toBeDefined();
   });
 });
 
@@ -559,7 +665,7 @@ describe('F14: fake-gh label filter ALL-label subset', () => {
       'bash',
       [
         '-c',
-        `PATH="${repo.binDir}:$PATH" GH_FAKE_STATE="${repo.stateFile}" ` +
+        `PATH="${repo.binDir}${nodePath.delimiter}$PATH" GH_FAKE_STATE="${repo.stateFile}" ` +
           `gh api 'repos/test/repo/issues?state=open&labels=auto-assigned,bug&per_page=100' --paginate`,
       ],
       { encoding: 'utf8' },
@@ -778,7 +884,7 @@ describe('F14: fake-gh label filter ALL-label subset', () => {
         COMMENTER_LOGIN: 'alice',
         GH_FAKE_STATE: repo.stateFile,
         ASSIGN_ELECTION_DELAY: '0',
-        PATH: `${repo.binDir}:${process.env.PATH}`,
+        PATH: `${repo.binDir}${nodePath.delimiter}${process.env.PATH}`,
         ASSIGN_SCRIPT: assignScript,
         SIGNAL_HOOK: hookFile,
       };

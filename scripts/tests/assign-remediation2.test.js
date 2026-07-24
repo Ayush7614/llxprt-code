@@ -21,6 +21,7 @@
 import { describe, expect, it } from 'vitest';
 import { existsSync, readFileSync, writeFileSync } from 'fs';
 import * as nodePath from 'path';
+import yaml from 'js-yaml';
 import {
   createFakeRepo,
   defaultState,
@@ -284,9 +285,15 @@ describe('B: Targeted REST mutations', () => {
 
     const result = repo.runCleanup();
 
-    // stale-user should be removed, human-contributor should survive
+    // Targeted DELETE removed stale-user; the fresh human-contributor
+    // assignment survives because the DELETE is login-targeted.
     expect(result.state.issues['42']._assignees).not.toContain('stale-user');
     expect(result.state.issues['42']._assignees).toContain('human-contributor');
+    // J1 reconciliation: a fresh assignment transition appeared after the
+    // pre-delete snapshot, so the auto-assigned marker is preserved and
+    // the cleanup reports nonzero (retained state for reconciliation).
+    expect(result.state.issues['42']._label_names).toContain('auto-assigned');
+    expect(result.status).not.toBe(0);
   });
 
   it('preserves human label added between read and mutation', () => {
@@ -850,10 +857,8 @@ describe('E: PR filtering', () => {
 // ===========================================================================
 
 describe('F: Per-issue concurrency and post-cap rollback', () => {
-  it('serializes attempts per stable actor ID without cancelling in progress', async () => {
-    const yaml = (await import('js-yaml')).default;
-    const fs = await import('fs');
-    const source = fs.readFileSync(
+  it('groups concurrency by commenter ID AND issue number to allow independent distinct issues', () => {
+    const source = readFileSync(
       nodePath.join(
         import.meta.dirname,
         '../..',
@@ -865,7 +870,8 @@ describe('F: Per-issue concurrency and post-cap rollback', () => {
     expect(workflow.jobs, 'workflow should have jobs').toBeDefined();
     expect(workflow.jobs.assign, 'assign job should exist').toBeDefined();
     expect(workflow.jobs.assign.concurrency).toEqual({
-      group: 'assign-${{ github.event.comment.user.id }}',
+      group:
+        'assign-${{ github.event.comment.user.id }}-${{ github.event.issue.number }}',
       'cancel-in-progress': false,
     });
   });

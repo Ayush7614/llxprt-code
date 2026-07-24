@@ -64,9 +64,16 @@ describe('.github/workflows/assign.yml', () => {
     );
   });
 
-  it('serializes attempts per stable actor ID without cancelling in progress', () => {
+  it('groups concurrency by actor+issue to allow independent distinct issues', () => {
+    // GitHub retains only one pending job per concurrency group. Commenter-
+    // ID-only grouping would cancel a valid /assign on a distinct issue.
+    // Grouping by actor+issue allows distinct-issue commands to run
+    // independently while still bounding same-actor-same-issue fan-out.
+    // The real-script post-mutation cap enforcement/election remains
+    // authoritative for bounding total assignments.
     expect(job.concurrency).toEqual({
-      group: 'assign-${{ github.event.comment.user.id }}',
+      group:
+        'assign-${{ github.event.comment.user.id }}-${{ github.event.issue.number }}',
       'cancel-in-progress': false,
     });
   });

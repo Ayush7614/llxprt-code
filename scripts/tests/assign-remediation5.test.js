@@ -18,6 +18,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { execFileSync } from 'child_process';
+import * as nodePath from 'path';
 import {
   createFakeRepo,
   defaultState,
@@ -29,6 +30,9 @@ import {
   failOnNth,
   runRecordHistory,
 } from './assign-helpers.js';
+
+const HISTORY_COLOR = '0E8A16';
+const HISTORY_DESC = 'Issue assignment history index';
 
 function defaultStateWith(overrides) {
   return { ...defaultState(), ...overrides };
@@ -88,7 +92,7 @@ describe('G1: state=all eligibility query', () => {
       'bash',
       [
         '-c',
-        `PATH="${repo.binDir}:$PATH" GH_FAKE_STATE="${repo.stateFile}" ` +
+        `PATH="${repo.binDir}${nodePath.delimiter}$PATH" GH_FAKE_STATE="${repo.stateFile}" ` +
           `gh api 'repos/test/repo/issues?assignee=u&per_page=100'`,
       ],
       { encoding: 'utf8' },
@@ -116,7 +120,7 @@ describe('G1: state=all eligibility query', () => {
       'bash',
       [
         '-c',
-        `PATH="${repo.binDir}:$PATH" GH_FAKE_STATE="${repo.stateFile}" ` +
+        `PATH="${repo.binDir}${nodePath.delimiter}$PATH" GH_FAKE_STATE="${repo.stateFile}" ` +
           `gh api 'repos/test/repo/issues?assignee=u&state=all&per_page=100'`,
       ],
       { encoding: 'utf8' },
@@ -153,7 +157,7 @@ describe('G1b: fake-gh search and events fidelity', () => {
       'bash',
       [
         '-c',
-        `PATH="${repo.binDir}:$PATH" GH_FAKE_STATE="${repo.stateFile}" ` +
+        `PATH="${repo.binDir}${nodePath.delimiter}$PATH" GH_FAKE_STATE="${repo.stateFile}" ` +
           `gh api 'search/issues?q=repo:test/repo+author:alice+type:pr+is:merged&per_page=1'`,
       ],
       { encoding: 'utf8' },
@@ -201,7 +205,7 @@ describe('G1b: fake-gh search and events fidelity', () => {
       'bash',
       [
         '-c',
-        `PATH="${repo.binDir}:$PATH" GH_FAKE_STATE="${repo.stateFile}" ` +
+        `PATH="${repo.binDir}${nodePath.delimiter}$PATH" GH_FAKE_STATE="${repo.stateFile}" ` +
           `gh api 'repos/test/repo/issues/events'`,
       ],
       { encoding: 'utf8' },
@@ -220,9 +224,6 @@ describe('G1b: fake-gh search and events fidelity', () => {
 // ===========================================================================
 
 describe('G2: record-history return-code capture', () => {
-  const HISTORY_COLOR = '0E8A16';
-  const HISTORY_DESC = 'Issue assignment history index';
-
   it('initial GET API error exits nonzero and performs no POST', () => {
     // The initial validate_history_label GET fails (500). The script must
     // capture the return code, exit nonzero, and NOT POST a label.
@@ -365,9 +366,6 @@ describe('G2: record-history return-code capture', () => {
 // ===========================================================================
 
 describe('G2b: validate_history_label stderr separation', () => {
-  const HISTORY_COLOR = '0E8A16';
-  const HISTORY_DESC = 'Issue assignment history index';
-
   it('stderr warning during initial GET does not corrupt 404 absence detection', () => {
     // gh writes a warning to stderr while the label GET returns 404 (absent).
     // The script must detect 404 from stderr and proceed to create the label.
@@ -426,6 +424,119 @@ describe('G2b: validate_history_label stderr separation', () => {
     // POST failed, recheck found label with correct definition → success
     expect(result.status).toBe(0);
     expect(result.state.labels['asnhist--recheckwarn']).toBeDefined();
+  });
+});
+
+// ===========================================================================
+// G2c: post-POST diagnostic distinguishes ABSENT / COLLISION / API_ERROR
+// ===========================================================================
+
+describe('G2c: post-failed-POST diagnostic distinction', () => {
+  it('absent label after failed POST reports creation failed (not conflict)', () => {
+    // POST /labels fails, recheck finds label absent. The stderr diagnostic
+    // must indicate creation failed, NOT report a conflicting definition.
+    const result = runRecordHistory({
+      state: {
+        labels: {},
+        fail_config: failOnNth({
+          method: 'POST',
+          endpoint: 'repos/test/repo/labels',
+          on_nth: 1,
+          type: 'error',
+        }),
+      },
+      assigneeLogin: 'absentdiag',
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.state.labels['asnhist--absentdiag']).toBeUndefined();
+    // Must report creation failed, NOT conflict/collision
+    expect(result.stderr).toMatch(/create|creation|failed/i);
+    expect(result.stderr).not.toMatch(/conflict|collision/i);
+  });
+
+  it('conflicting label after failed POST reports conflict', () => {
+    // POST /labels fails, recheck finds a label with WRONG definition. The
+    // stderr diagnostic must report conflict (not creation failed).
+    const result = runRecordHistory({
+      state: {
+        labels: {
+          'asnhist--conflictdiag': {
+            name: 'asnhist--conflictdiag',
+            color: 'FF0000',
+            description: 'Human label',
+          },
+        },
+        fail_config: failOnNth({
+          method: 'POST',
+          endpoint: 'repos/test/repo/labels',
+          on_nth: 1,
+          type: 'error',
+        }),
+      },
+      assigneeLogin: 'conflictdiag',
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.state.labels['asnhist--conflictdiag'].color).toBe('FF0000');
+    // Must report conflict
+    expect(result.stderr).toMatch(/conflict|collision/i);
+  });
+
+  it('API error during post-POST recheck reports check failure (not absence)', () => {
+    // POST fails, then the recheck GET returns 500. The stderr diagnostic
+    // must report a check/API failure, NOT absence or conflict.
+    const result = runRecordHistory({
+      state: {
+        labels: {},
+        fail_config: {
+          requests: [
+            {
+              method: 'POST',
+              endpoint: 'repos/test/repo/labels',
+              on_nth: 1,
+              type: 'error',
+            },
+            {
+              method: 'GET',
+              endpoint: 'repos/test/repo/labels/asnhist--checkfail',
+              on_nth: 2,
+              type: 'error',
+              http_status: 500,
+            },
+          ],
+        },
+      },
+      assigneeLogin: 'checkfail',
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.state.labels['asnhist--checkfail']).toBeUndefined();
+    // Must report API/check error, NOT absence or conflict
+    expect(result.stderr).toMatch(/check|api|error|failed/i);
+    expect(result.stderr).not.toMatch(/conflict|collision/i);
+  });
+
+  it('includes sanitized POST stderr first line in final diagnostic on creation failure', () => {
+    // POST /labels fails. The final stderr diagnostic must include a
+    // sanitized first line from the POST's own stderr output.
+    const result = runRecordHistory({
+      state: {
+        labels: {},
+        fail_config: failOnNth({
+          method: 'POST',
+          endpoint: 'repos/test/repo/labels',
+          on_nth: 1,
+          type: 'error',
+        }),
+      },
+      assigneeLogin: 'postdiag',
+    });
+
+    expect(result.status).not.toBe(0);
+    // The fake-gh POST failure writes a JSON message to stderr; the script
+    // must include at least one sanitized line from it in the diagnostic.
+    expect(result.stderr).toMatch(/Server Error|message|status|error|failed/i);
   });
 });
 
@@ -640,7 +751,7 @@ describe('G4: fake-gh 404 label DELETE + cleanup race resilience', () => {
         'bash',
         [
           '-c',
-          `PATH="${repo.binDir}:$PATH" GH_FAKE_STATE="${repo.stateFile}" ` +
+          `PATH="${repo.binDir}${nodePath.delimiter}$PATH" GH_FAKE_STATE="${repo.stateFile}" ` +
             `gh api --method DELETE 'repos/test/repo/issues/42/labels/nonexistent' --silent`,
         ],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
@@ -762,5 +873,68 @@ describe('G4: fake-gh 404 label DELETE + cleanup race resilience', () => {
     // Label DELETE failed → nonzero, label remains for retry
     expect(result.status).not.toBe(0);
     expect(result.state.issues['42']._label_names).toContain('auto-assigned');
+  });
+});
+
+// ===========================================================================
+// G5: discover_candidates diagnostics (captures and prints sanitized stderr)
+// ===========================================================================
+
+describe('G5: discover_candidates failure diagnostics', () => {
+  it('candidate discovery failure includes sanitized stderr in output', () => {
+    // The /issues endpoint fails during candidate discovery. The script must
+    // fail (via pipefail) and include a sanitized first line from gh stderr
+    // in its own diagnostic — NOT a bare "Candidate discovery failed" with
+    // no context. The fake-gh error message is "Server Error".
+    const repo = createFakeRepo(
+      defaultStateWith({
+        issues: {},
+        fail_config: failOnNth({
+          method: 'GET',
+          endpoint: 'repos/test/repo/issues',
+          on_nth: 1,
+          type: 'error',
+          http_status: 500,
+        }),
+      }),
+    );
+
+    const result = repo.runCleanup();
+
+    // Must fail — no partial results
+    expect(result.status).not.toBe(0);
+    // The combined stderr+stdout must include the sanitized gh error detail
+    // (the actual error message from the API, not just a generic "failed").
+    const combined = (result.stderr || '') + (result.stdout || '');
+    expect(combined).toMatch(/Server Error|status.*500/i);
+  });
+
+  it('candidate discovery failure does NOT return partial results', () => {
+    // Even with some valid issues present, if the paginated GET fails, no
+    // candidates should be processed (no mutations occur).
+    const repo = createFakeRepo(
+      defaultStateWith({
+        issues: {
+          42: makeIssue({
+            number: 42,
+            assignees: ['stale-user'],
+            labels: ['auto-assigned'],
+          }),
+        },
+        fail_config: failOnNth({
+          method: 'GET',
+          endpoint: 'repos/test/repo/issues',
+          on_nth: 1,
+          type: 'error',
+        }),
+      }),
+    );
+
+    const result = repo.runCleanup();
+
+    // Must fail
+    expect(result.status).not.toBe(0);
+    // No mutation occurred — stale-user still assigned
+    expect(result.state.issues['42']._assignees).toContain('stale-user');
   });
 });

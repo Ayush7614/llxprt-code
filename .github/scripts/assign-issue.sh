@@ -900,6 +900,12 @@ else
   if ! echo "${verified_labels_json}" | jq -e --arg lbl "${AUTO_ASSIGNED_LABEL}" '[.[].name] | index($lbl) != null' >/dev/null 2>&1; then
     abort_infra_error "‼ Label add failed and label is not present for #${ISSUE}"
   fi
+  # Label POST returned error but label IS confirmed present (applied_error
+  # or concurrent race). Track as confirmed-present so that ownership-aware
+  # rollback on every later failure and INT/TERM attempts marker removal.
+  # rollback_this_run / marker_removal_is_safe already preserve the marker
+  # when a competing assignment stint owns it.
+  label_added_by_this_run=true
 fi
 
 # Step 6: Add assignee (targeted POST).

@@ -244,11 +244,14 @@ def check_fail(state, method, base_path):
          "on_nth": 1, "type": "error"|"malformed"}]}
 
     For structured format, nth occurrence is tracked per (method, endpoint).
+    The ordinal increments exactly once per actual endpoint request, shared
+    across all matching rules.
     """
     fc = state.get("fail_config", {})
 
     # Check structured requests format first
     requests = fc.get("requests", [])
+    matching = []
     for req in requests:
         req_method = req.get("method", "GET").upper()
         if req_method != method:
@@ -258,15 +261,22 @@ def check_fail(state, method, base_path):
             regex = re.escape(endpoint).replace(r"\*", ".*")
             if not re.fullmatch(regex, base_path):
                 continue
-        on_nth = req.get("on_nth", 1)
+        matching.append(req)
+
+    if matching:
+        # Increment the ordinal exactly once for this (method, endpoint).
+        first = matching[0]
+        endpoint = first.get("endpoint", "")
         count_key = f"_fail_count_{method}_{endpoint}"
-        state[count_key] = state.get(count_key, 0) + 1
-        if state[count_key] == on_nth:
-            save_state(state)
-            fail_type = req.get("type", "error")
-            http_status = req.get("http_status")
-            return True, {"type": fail_type, "http_status": http_status}
+        ordinal = state.get(count_key, 0) + 1
+        state[count_key] = ordinal
         save_state(state)
+        # Evaluate all matching rules against the immutable ordinal.
+        for req in matching:
+            if ordinal == req.get("on_nth", 1):
+                fail_type = req.get("type", "error")
+                http_status = req.get("http_status")
+                return True, {"type": fail_type, "http_status": http_status}
 
     # Check flat format (applies to all methods, all occurrences)
     for pattern, fail_type in fc.items():
@@ -295,9 +305,11 @@ def apply_side_effects(state, method, base_path):
     AFTER the request is processed, for post-handler race simulation).
 
     Side effects are applied exactly once per invocation. Counting is
-    per (method, endpoint).
+    per (method, endpoint). The ordinal increments exactly once per actual
+    endpoint request, shared across all matching rules (pre and post).
     """
-    changed = False
+    # Collect all matching rules first.
+    matching = []
     for se in state.get("side_effects", []):
         if se.get("method", "GET").upper() != method.upper():
             continue
@@ -306,22 +318,40 @@ def apply_side_effects(state, method, base_path):
             regex = re.escape(endpoint).replace(r"\*", ".*")
             if not re.fullmatch(regex, base_path):
                 continue
-        count_key = f"_se_count_{method}_{endpoint}"
-        state[count_key] = state.get(count_key, 0) + 1
-        changed = True
-        if state[count_key] != se.get("on_nth", 1):
+        matching.append(se)
+
+    if not matching:
+        return
+
+    # Increment the ordinal exactly once for this (method, endpoint).
+    first = matching[0]
+    endpoint = first.get("endpoint", "")
+    count_key = f"_se_count_{method}_{endpoint}"
+    ordinal = state.get(count_key, 0) + 1
+    state[count_key] = ordinal
+    save_state(state)
+
+    # Evaluate all matching pre-effects against the immutable ordinal.
+    changed = False
+    for se in matching:
+        if ordinal != se.get("on_nth", 1):
             continue
         timing = se.get("timing", "pre")
         if timing == "post":
             continue
         _apply_side_effect_action(state, se)
+        changed = True
     if changed:
         save_state(state)
 
 
 def apply_post_side_effects(state, method, base_path):
-    """Apply post-handler side effects (after the request was processed)."""
-    changed = False
+    """Apply post-handler side effects (after the request was processed).
+
+    Shares the same ordinal as the pre-handler pass (incremented once per
+    actual endpoint request in apply_side_effects).
+    """
+    matching = []
     for se in state.get("side_effects", []):
         if se.get("method", "GET").upper() != method.upper():
             continue
@@ -330,9 +360,20 @@ def apply_post_side_effects(state, method, base_path):
             regex = re.escape(endpoint).replace(r"\*", ".*")
             if not re.fullmatch(regex, base_path):
                 continue
-        count_key = f"_se_count_{method}_{endpoint}"
-        current = state.get(count_key, 0)
-        if current != se.get("on_nth", 1):
+        matching.append(se)
+
+    if not matching:
+        return
+
+    # Read the ordinal already set by apply_side_effects.
+    first = matching[0]
+    endpoint = first.get("endpoint", "")
+    count_key = f"_se_count_{method}_{endpoint}"
+    ordinal = state.get(count_key, 0)
+
+    changed = False
+    for se in matching:
+        if ordinal != se.get("on_nth", 1):
             continue
         timing = se.get("timing", "pre")
         if timing != "post":
@@ -424,6 +465,19 @@ def _apply_side_effect_action(state, se):
                 "created_at": se.get(
                     "created_at", state.get("now", "2025-07-23T00:00:00Z")
                 ),
+            })
+    elif action == "unassign" and issue is not None:
+        a = se["assignee"]
+        actor = se.get("actor", "concurrent-user")
+        if a in issue.get("_assignees", []):
+            issue["_assignees"] = [
+                login for login in issue["_assignees"] if login != a
+            ]
+            _add_timeline_event(state, se.get("issue"), {
+                "event": "unassigned",
+                "actor": {"login": actor, "type": "User"},
+                "assignee": {"login": a},
+                "created_at": state.get("now", "2025-07-23T00:00:00Z"),
             })
 
 
@@ -640,6 +694,18 @@ def handle_get(state, base_path, params, do_paginate):
 
     m = re.match(rf"^{REPO_PREFIX}/issues$", base_path)
     if m:
+        # Validate state filter — must be a known value.
+        state_filter = params.get("state", "open")
+        valid_state_values = {"open", "closed", "all"}
+        if state_filter is not None and state_filter not in valid_state_values:
+            die(
+                json.dumps({
+                    "message": "Validation Failed",
+                    "errors": [{"field": "state", "code": "invalid",
+                                 "message": f"Invalid state value: {state_filter}"}],
+                }),
+                1,
+            )
         results = []
         # GitHub defaults omitted state to "open" for /issues listing.
         state_filter = params.get("state", "open")
@@ -748,6 +814,46 @@ def handle_search(state, params):
             elif qualifier == "pr":
                 is_pr = True
 
+    # Validate type: qualifier — must be a known value.
+    valid_types = {"issue", "pr"}
+    if item_type is not None and item_type not in valid_types:
+        die(
+            json.dumps({
+                "message": "Validation Failed",
+                "errors": [{"field": "q", "code": "invalid",
+                             "message": f"Invalid type qualifier: {item_type}"}],
+            }),
+            1,
+        )
+
+    # Validate is: qualifiers — must be known values.
+    valid_is = {"merged", "open", "closed", "issue", "pr", "public", "private"}
+    for term in terms:
+        if term.startswith("is:"):
+            qualifier = term[3:]
+            if qualifier not in valid_is:
+                die(
+                    json.dumps({
+                        "message": "Validation Failed",
+                        "errors": [{"field": "q", "code": "invalid",
+                                     "message": f"Invalid is qualifier: {qualifier}"}],
+                    }),
+                    1,
+                )
+
+    # Validate state: qualifier — must be a known value.
+    if state_filter is not None:
+        valid_states = {"open", "closed"}
+        if state_filter not in valid_states:
+            die(
+                json.dumps({
+                    "message": "Validation Failed",
+                    "errors": [{"field": "q", "code": "invalid",
+                                 "message": f"Invalid state qualifier: {state_filter}"}],
+                }),
+                1,
+            )
+
     # repo: filter — fake models a single repo, so if repo: doesn't match the
     # configured GITHUB_REPOSITORY, return zero results.
     configured_repo = state.get("repo", "test/repo")
@@ -847,6 +953,9 @@ def handle_post(state, base_path, body):
             label_names = body
         elif body and "labels" in body and isinstance(body["labels"], list):
             label_names = body["labels"]
+        elif body and "labels" in body:
+            validate_array_field(body, "labels")
+            label_names = []
         else:
             label_names = []
         for name in label_names:
@@ -872,6 +981,9 @@ def handle_post(state, base_path, body):
             logins = body["assignees"]
         elif body and isinstance(body, list):
             logins = body
+        elif body and "assignees" in body:
+            validate_array_field(body, "assignees")
+            logins = []
         else:
             logins = []
         unassignable = state.get("unassignable_logins", [])
@@ -961,7 +1073,10 @@ def handle_patch(state, base_path, body):
             validate_array_field(body, "assignees")
             validate_array_field(body, "labels")
             if "assignees" in body:
-                issue["_assignees"] = list(body["assignees"])
+                unassignable = state.get("unassignable_logins", [])
+                requested = list(body["assignees"])
+                filtered = [a for a in requested if a not in unassignable]
+                issue["_assignees"] = filtered
             if "labels" in body:
                 issue["_label_names"] = list(body["labels"])
             if "state" in body:

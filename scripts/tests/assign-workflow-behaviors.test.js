@@ -76,9 +76,15 @@ describe('assign.yml workflow configuration', () => {
     );
   });
 
-  it('serializes attempts per stable actor ID without cancelling in progress', () => {
+  it('groups concurrency by actor+issue to allow independent distinct issues', () => {
+    // GitHub retains only one pending job per concurrency group. Commenter-
+    // ID-only grouping would cancel a valid /assign on a distinct issue.
+    // Grouping by actor+issue allows distinct-issue commands to run
+    // independently. The real-script post-mutation cap enforcement/election
+    // remains authoritative for bounding total assignments.
     expect(job?.concurrency).toEqual({
-      group: 'assign-${{ github.event.comment.user.id }}',
+      group:
+        'assign-${{ github.event.comment.user.id }}-${{ github.event.issue.number }}',
       'cancel-in-progress': false,
     });
   });
@@ -141,6 +147,16 @@ describe('assign.yml record-history job', () => {
     expect(runText).toContain('record-assignment-history.sh');
     // Must NOT contain inline label creation logic (delegated to script)
     expect(runStep?.run).not.toMatch(/\/issues\/\d+\/labels/);
+  });
+
+  it('serializes record-history per stable assignee ID without cancelling in progress', () => {
+    // Per-assignee concurrency bounds fan-out for the same user's assignment
+    // events while allowing independent assignees to proceed. In-flight runs
+    // complete rather than being cancelled (avoid partial label state).
+    expect(job?.concurrency).toEqual({
+      group: 'record-history-${{ github.event.assignee.id }}',
+      'cancel-in-progress': false,
+    });
   });
 });
 

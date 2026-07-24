@@ -389,7 +389,7 @@ function setupConcurrencyRepo(initialState) {
   };
   writeFileSync(stateFile, JSON.stringify(baseState, null, 2));
 
-  const pathWithFakeGh = binDir + ':' + process.env.PATH;
+  const pathWithFakeGh = binDir + nodePath.delimiter + process.env.PATH;
 
   return { dir, stateFile, binDir, pathWithFakeGh };
 }

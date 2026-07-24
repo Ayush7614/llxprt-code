@@ -100,6 +100,9 @@ describe('H1: Closed assignment target', () => {
       'auto-assigned',
     );
     expect(result.state.labels['asnhist--alice']).toBeUndefined();
+    // User-facing feedback must be posted explaining the refusal
+    const comments = result.state.comments.filter((c) => c.issue_number === 42);
+    expect(comments.some((c) => /closed|not open/i.test(c.body))).toBe(true);
   });
 
   it('malformed issue state is infrastructure failure (exit 1)', () => {
