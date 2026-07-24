@@ -64,6 +64,10 @@ case ${rc:-0} in
     echo "‼ Failed to check label ${LABEL_NAME} (API error)" >&2
     exit 1
     ;;
+  *)
+    echo "‼ Unexpected label validation status: ${rc:-0}" >&2
+    exit 1
+    ;;
 esac
 
 if ! gh api --method POST "repos/${REPO}/labels" \

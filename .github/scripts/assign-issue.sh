@@ -254,6 +254,10 @@ ensure_label_exists() {
       return 1
       ;;
     3) return 1 ;;   # API error
+    *)
+      echo "‼ Unexpected label validation status: ${rc}" >&2
+      return 1
+      ;;
   esac
   # Create the label.
   if ! gh api --method POST "repos/${REPO}/labels" \
@@ -661,6 +665,9 @@ if [[ "${is_eligible}" != "true" ]]; then
     1) ;;  # absent — not eligible via history
     2)
       abort_infra_error "‼ Failed to query historical assignment for @${USER_LOGIN}"
+      ;;
+    *)
+      abort_infra_error "‼ Unexpected historical assignment status for @${USER_LOGIN}: ${hist_rc}"
       ;;
   esac
 fi
